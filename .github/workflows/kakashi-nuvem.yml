@@ -1,0 +1,84 @@
+name: Kakashi Nuvem (Postagem + Radar 24h)
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      forcar:
+        description: 'Rodar mesmo com o PC ligado (teste)'
+        required: false
+        default: '1'
+
+concurrency:
+  group: kakashi-nuvem
+  cancel-in-progress: false
+
+jobs:
+  postar-e-radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: America/Sao_Paulo
+      POSTAGEM_DIR: ${{ github.workspace }}/output/postagem
+      POSTAGEM_DRIVE: ${{ github.workspace }}/drive_postagens
+      AVATAR_DRIVE_DIR: ${{ github.workspace }}/drive_avatares
+      FORCAR_NUVEM: ${{ github.event.inputs.forcar || '0' }}
+
+    steps:
+      - name: Checkout codigo do Kakashi
+        uses: actions/checkout@v4
+
+      - name: Configurar rclone (Google Drive)
+        env:
+          RCLONE_CONF_SECRET: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if ! command -v rclone >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq rclone ffmpeg
+          fi
+          mkdir -p ~/.config/rclone
+          printf "%s\n" "$RCLONE_CONF_SECRET" > ~/.config/rclone/rclone.conf
+          mkdir -p "$POSTAGEM_DIR/videos" "$POSTAGEM_DRIVE" "$AVATAR_DRIVE_DIR"
+
+      - name: Checar se o PC esta acordado (Heartbeat)
+        id: check_pc
+        run: |
+          rclone copyto "gdrive:Non Shop/001/_kakashi_nuvem/heartbeat_pc.json" "$POSTAGEM_DIR/heartbeat_pc.json" || true
+          python3 - << 'EOF'
+          import json, os, time
+          from pathlib import Path
+          hb_path = Path(os.environ["POSTAGEM_DIR"]) / "heartbeat_pc.json"
+          forcar = os.environ.get("FORCAR_NUVEM") == "1" or os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+          ativo = False
+          if hb_path.is_file() and not forcar:
+              try:
+                  hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                  delta = int(time.time()) - int(hb.get("em") or 0)
+                  if 0 <= delta < 300:
+                      print(f"PC acordado ha {delta}s ({hb.get('hora')}). Nuvem em standby.")
+                      ativo = True
+              except Exception:
+                  pass
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"pc_ativo={'true' if ativo else 'false'}\n")
+          EOF
+
+      - name: Baixar fila, tokens e videos pendentes do Google Drive
+        if: steps.check_pc.outputs.pc_ativo != 'true'
+        run: |
+          rclone copy "gdrive:Non Shop/001/_kakashi_nuvem" "$POSTAGEM_DIR" --exclude "*.tmp"
+          rclone copy "gdrive:Non Shop/001/Postagens" "$POSTAGEM_DRIVE" --max-age 72h || true
+
+      - name: Executar Postador + Roleta + Radar (Discord)
+        if: steps.check_pc.outputs.pc_ativo != 'true'
+        run: |
+          python3 tools/clone/rodar_nuvem.py
+
+      - name: Devolver fila e Radar atualizados para o Google Drive
+        if: steps.check_pc.outputs.pc_ativo != 'true'
+        run: |
+          for arq in fila.json contas.json roleta.json radar.json nuvem_status.json; do
+            if [ -f "$POSTAGEM_DIR/$arq" ]; then
+              rclone copyto "$POSTAGEM_DIR/$arq" "gdrive:Non Shop/001/_kakashi_nuvem/$arq"
+            fi
+          done
