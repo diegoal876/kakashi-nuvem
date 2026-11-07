@@ -1470,7 +1470,7 @@ def _devidos(item: dict, agora: float) -> list[tuple[str, bool]]:
         pid = d.partition(":")[2]
         if not q or q <= agora:
             out.append((d, False))
-        elif d.startswith("fb:") and pid not in sem_sched and q - agora >= NATIVO_MIN_S:
+        elif d.startswith("fb:") and pid not in sem_sched and q > agora + 120:
             out.append((d, True))
     return out
 
@@ -1580,6 +1580,7 @@ def _checar_tokens() -> None:
             _salvar()
     if caidas and not antes:
         _log(f"A Meta derrubou a conexao de {len(caidas)} de {len(paginas)} Pagina(s): reconecte em 1. Contas.")
+        _alerta_discord("tokens_caidos", f"⚠️ **Conexão da Meta caiu em {len(caidas)} de {len(paginas)} Página(s):** {', '.join(caidas[:10])}. Reconecte em `1. Contas`.")
     elif antes and not caidas:
         _log("A conexao com a Meta voltou em todas as Paginas.")
 
@@ -1692,6 +1693,9 @@ def _postar_devidos() -> None:
                 _salvar()
                 _log(f"Adiado para {_quando_txt(novo)} · {_nome_destino(dest)} · {item['nome']} · 3h depois do ultimo video da Pagina")
                 continue
+            if meta and item.get("quando") and item["quando"] - time.time() < NATIVO_MIN_S:
+                item["quando"] = int(time.time() + NATIVO_MIN_S + 60)
+                _salvar()
             item["andamento"] = f"Enviando para {_nome_destino(dest)}..."
             path, legenda, info = VIDEOS / item["arquivo"], item["legenda"], item["info"]
             quando = item["quando"] if meta else None
@@ -1724,11 +1728,24 @@ def _postar_devidos() -> None:
             if isinstance(e, GraphError) and e.bloqueio:
                 bloqueio = e
             restrita = isinstance(e, GraphError) and e.code == RESTRICAO_COD
-        res["em"] = int(time.time())
         _envio["ultimo"] = time.time()
+        if res.get("estado") == "erro" and not bloqueio and not restrita:
+            with lock:
+                item = _item(iid)
+                tent = int((item or {}).get("tentativas") or 0) + 1
+                if item and tent < 3:
+                    item["tentativas"] = tent
+                    item["andamento"] = ""
+                    item["quando"] = int(max(item.get("quando") or 0, time.time()) + 600)
+                    _salvar()
+                    _log(f"Falha temporaria ({res['erro']}); tentativa automatica {tent}/3 em 10 min · {_nome_destino(dest)} · {item['nome']}")
+                    continue
+        res["em"] = int(time.time())
         with lock:
             item = _item(iid)
             if item:
+                if res.get("estado") != "erro":
+                    item.pop("tentativas", None)
                 item["resultados"][dest] = res
                 item["andamento"] = ""
                 if not _restantes(item):
@@ -1738,6 +1755,8 @@ def _postar_devidos() -> None:
             res["estado"], "ERRO")
         _log(f"{verbo} · {_nome_destino(dest)} · {item['nome'] if item else iid}" +
              (f" · {res['erro']}" if res.get("erro") else ""))
+        if res.get("estado") == "erro" and not bloqueio:
+            _alerta_discord(f"erro:{iid}:{dest}", f"❌ **Falha ao postar vídeo (após 3 tentativas)**\nPágina: **{_nome_destino(dest)}**\nVídeo: `{item['nome'] if item else iid}`\nMotivo: {res.get('erro', '')}")
         if bloqueio:
             _bloquear(bloqueio)
         if restrita:
@@ -1973,6 +1992,50 @@ def _sincronizar_nuvem(forcar: bool = False) -> None:
         pass
 
 
+def _alerta_discord(chave: str, texto: str) -> None:
+    """Send an operational alert to the Discord webhook configured in radar.json (at most once every 6h per key)."""
+    try:
+        agora = int(time.time())
+        with lock:
+            alertas = fila.setdefault("alertas_discord", {})
+            if agora - int(alertas.get(chave) or 0) < 6 * 3600:
+                return
+            alertas[chave] = agora
+            _salvar()
+        r_cfg = _load(DIR / "radar.json", {}).get("config", {})
+        url = r_cfg.get("webhook") or r_cfg.get("webhook_relatorio") or ""
+        if not url:
+            return
+        corpo = json.dumps({"content": texto[:1900], "allowed_mentions": {"parse": []}}).encode()
+        req = urllib.request.Request(url, corpo, {"Content-Type": "application/json", "User-Agent": "Kakashi-Postagem/1.0"})
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except Exception:
+        pass
+
+
+def _checar_atrasos() -> None:
+    """Warn on Discord if scheduled videos are overdue by >45 min and no upload happened in the last 15 min."""
+    if fila.get("bloqueio"):
+        return
+    agora = time.time()
+    if _envio["ultimo"] and agora - _envio["ultimo"] < 15 * 60:
+        return
+    with lock:
+        caidas = set((fila.get("tokens_caidos") or {}).get("ids", []))
+        atrasados = [
+            i for i in fila.get("itens", [])
+            if i.get("status") == "agendado" and i.get("quando") and agora - i["quando"] > 45 * 60
+            and any(d.partition(":")[2] not in caidas for d, _ in _devidos(i, agora))
+        ]
+    if atrasados and (_envio["ultimo"] == 0 or agora - _envio["ultimo"] >= 15 * 60):
+        mais_antigo = min(i["quando"] for i in atrasados)
+        _alerta_discord(
+            f"atraso:{int(mais_antigo // 3600)}",
+            f"⚠️ **Alerta de Fila Atrasada no Kakashi:** {len(atrasados)} vídeo(s) estão agendados desde {_quando_txt(mais_antigo)} aguardando envio."
+        )
+
+
 def _manter_acordado() -> None:
     if sys.platform != 'win32':
         return
@@ -1988,7 +2051,7 @@ def _manter_acordado() -> None:
 def _worker() -> None:
     while True:
         for passo in (_manter_acordado, _sincronizar_nuvem, _checar_tokens, _auto_paginas, _scan_entrada, _scan_drive, _scan_kakashi,
-                      _repor_auto, _postar_devidos, _acompanhar_meta, _conferir_meta, _limpar_postados):
+                      _repor_auto, _postar_devidos, _acompanhar_meta, _conferir_meta, _checar_atrasos, _limpar_postados):
             try:
                 passo()
             except Exception as e:  # keep the loop alive whatever one pass hits
@@ -2103,6 +2166,7 @@ def agendar(body: dict) -> str:
         _agendar(item)
         _salvar()
         q, dests = item["quando"], _restantes(item)
+    threading.Thread(target=_sincronizar_nuvem, kwargs={"forcar": True}, daemon=True).start()
     wake.set()
     if not q:
         return "Postando agora..."
@@ -2183,6 +2247,7 @@ def lote(body: dict) -> str:
                 continue
             feitos.append(item["quando"])
         _salvar()
+    threading.Thread(target=_sincronizar_nuvem, kwargs={"forcar": True}, daemon=True).start()
     wake.set()
     if not feitos:
         raise Recusa("Nenhum video agendado: escolha a Pagina deles primeiro.")
@@ -2272,6 +2337,7 @@ def agendar_sugeridos(body: dict) -> str:
                 continue
             feitos.append(item["quando"])
         _salvar()
+    threading.Thread(target=_sincronizar_nuvem, kwargs={"forcar": True}, daemon=True).start()
     wake.set()
     if not feitos:
         raise Recusa("Nenhum video agendado: escolha a Pagina deles primeiro.")

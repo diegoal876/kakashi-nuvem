@@ -2,7 +2,8 @@ name: Kakashi Nuvem (Postagem + Radar 24h)
 
 on:
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '*/15 * * * *'
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       forcar:
@@ -105,7 +106,7 @@ jobs:
             fi
           done
 
-      - name: Auto-encadear proxima execucao se ainda restarem videos devidos na fila
+      - name: Auto-encadear proxima execucao se ainda restarem videos na fila
         if: steps.check_pc.outputs.pc_ativo != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -124,10 +125,13 @@ jobs:
               except Exception:
                   pass
           restam = any(
-              i.get("status") == "agendado" and postagem._devidos(i, agora + 300)
+              i.get("status") == "agendado" and (
+                  postagem._devidos(i, agora + 3600)
+                  or (i.get("quando") and i["quando"] <= agora + 2 * 3600 and postagem._restantes(i))
+              )
               for i in postagem.fila.get("itens", [])
           )
           if restam:
-              print("Ainda ha videos devidos na fila; disparando proxima execucao automatica...")
+              print("Ainda ha videos devidos ou proximos na fila; disparando proxima execucao automatica...")
               subprocess.run(["gh", "workflow", "run", "kakashi-nuvem.yml", "-f", "forcar=0"], check=False)
           EOF

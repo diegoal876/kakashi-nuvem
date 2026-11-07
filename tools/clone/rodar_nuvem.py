@@ -1,5 +1,6 @@
 """Cloud runner executed by GitHub Actions when the PC is asleep or turned off.
-Reads state synced in _kakashi_nuvem, scans Google Drive for new videos, posts all due items to Meta,
+Reads state synced in _kakashi_nuvem, scans Google Drive for new videos, posts all due items to Meta
+(including active Sentinel Mode waiting for upcoming scheduled slots within the execution window),
 runs the Radar collection/Discord alerts if due, and writes nuvem_status.json for the PC to import later.
 """
 import json
@@ -20,6 +21,8 @@ import radar
 
 PC_ATIVO_JANELA_S = 300  # 5 minutes: if the PC updated heartbeat_pc.json within 5 min, the PC is awake
 MAX_ENVIOS_POR_EXECUCAO = 60  # Up to 60 videos per cloud run (~2.5h), then auto-chains next workflow run
+TEMPO_MAX_EXECUCAO_S = 150 * 60  # 2.5 hours max active time per GitHub Actions job
+SENTINELA_JANELA_S = 90 * 60  # Stay awake waiting if the next scheduled post is within 90 minutes
 GDRIVE_NUVEM = "gdrive:Non Shop/001/_kakashi_nuvem"
 GDRIVE_POSTAGENS = "gdrive:Non Shop/001/Postagens"
 
@@ -31,6 +34,23 @@ def _tem_devidos_agora() -> bool:
             if item.get("status") in ("agendado", "postando") and postagem._devidos(item, agora):
                 return True
     return False
+
+
+def _proximo_vencimento() -> float | None:
+    """Earliest timestamp when a pending scheduled item will become due in the cloud."""
+    agora = time.time()
+    tempos = []
+    with postagem.lock:
+        caidas = set((postagem.fila.get("tokens_caidos") or {}).get("ids", []))
+        for item in postagem.fila.get("itens", []):
+            if item.get("status") != "agendado":
+                continue
+            rest = [d for d in postagem._restantes(item) if d.partition(":")[2] not in caidas]
+            if not rest:
+                continue
+            q = item.get("quando") or agora
+            tempos.append(float(q))
+    return min(tempos) if tempos else None
 
 
 def _pc_acordou_agora() -> bool:
@@ -104,6 +124,7 @@ def _esperar_preparando(timeout_s: int = 60) -> None:
 
 
 def main() -> int:
+    inicio_exec = time.time()
     if _pc_acordou_agora():
         return 0
 
@@ -128,9 +149,26 @@ def main() -> int:
     except Exception as e:
         print(f"[Kakashi Nuvem] Aviso no scan/preparo: {e}", flush=True)
 
-    # 2. Send all due posts (respecting ENVIO_INTERVALO_S = 150s between sends) with live checkpointing
+    # 2. Send all due posts + Sentinel Mode (wait for upcoming posts if within SENTINELA_JANELA_S)
     enviados = 0
-    while _tem_devidos_agora() and enviados < MAX_ENVIOS_POR_EXECUCAO:
+    while enviados < MAX_ENVIOS_POR_EXECUCAO and (time.time() - inicio_exec) < TEMPO_MAX_EXECUCAO_S:
+        if not _tem_devidos_agora():
+            prox = _proximo_vencimento()
+            agora = time.time()
+            espera = (prox - agora) if prox else None
+            if espera is not None and 0 < espera <= SENTINELA_JANELA_S and (agora + espera - inicio_exec) < TEMPO_MAX_EXECUCAO_S:
+                mins = max(1, int(espera // 60))
+                print(f"[Kakashi Nuvem · Sentinela] Proximo video em ~{mins} min ({datetime.fromtimestamp(prox):%H:%M}). Aguardando...", flush=True)
+                dormir = min(60, max(5, int(espera)))
+                for _ in range(max(1, dormir // 30)):
+                    time.sleep(min(30, dormir))
+                    if _pc_acordou_agora():
+                        return 0
+                postagem._acompanhar_meta()
+                postagem._conferir_meta()
+                continue
+            break
+
         if enviados > 0:
             print(f"[Kakashi Nuvem] Aguardando {postagem.ENVIO_INTERVALO_S}s de intervalo seguro entre envios...", flush=True)
             for _ in range(int(postagem.ENVIO_INTERVALO_S // 30)):
@@ -148,6 +186,8 @@ def main() -> int:
 
     postagem._acompanhar_meta()
     postagem._conferir_meta()
+    postagem._checar_tokens()
+    postagem._checar_atrasos()
 
     # 3. Run Radar checks & collection if due
     try:
