@@ -15,7 +15,14 @@ import radar
 ARQUIVOS_JSON = ("fila.json", "contas.json", "roleta.json", "radar.json")
 INTERVALO_SYNC_S = 25
 RCLONE_EXE = Path(__file__).resolve().parents[1] / "nuvem_bin" / "rclone.exe"
-_estado_sync = {"ultimo": 0.0, "mtimes": {}, "importado_em": 0, "ultimo_rclone": 0.0}
+GDRIVE_NUVEM = "gdrive:Non Shop/001/_kakashi_nuvem"
+_estado_sync = {
+    "ultimo": 0.0,
+    "mtimes": {},
+    "importado_em": 0,
+    "ultimo_rclone": 0.0,
+    "checou_nuvem": False,
+}
 
 
 def pasta_nuvem() -> Path | None:
@@ -57,21 +64,26 @@ def _gravar_json(path: Path, data: dict) -> None:
         pass
 
 
-def importar_da_nuvem() -> bool:
-    """If GitHub Actions ran while the PC was asleep/off, merge its posted results and radar readings into memory."""
+def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
+    """If GitHub Actions ran while the PC was asleep/off, merge its posted results and radar readings into memory.
+    Returns (mudou, rede_ok). When exigir_rede is True (on startup or wake from sleep), rede_ok indicates whether
+    rclone could reach Google Drive so we never overwrite cloud state before checking it first.
+    """
     nuvem = pasta_nuvem()
     if not nuvem or not nuvem.is_dir():
-        return False
+        return False, False
     # Pull nuvem_status.json directly via rclone if Google Drive for Desktop hasn't synced it yet
-    _rclone_cmd("copyto", "gdrive:Non Shop/001/_kakashi_nuvem/nuvem_status.json", str(nuvem / "nuvem_status.json"), timeout=15)
+    rede_ok = _rclone_cmd("copyto", f"{GDRIVE_NUVEM}/nuvem_status.json", str(nuvem / "nuvem_status.json"), timeout=15)
+    if exigir_rede and not rede_ok and RCLONE_EXE.is_file():
+        return False, False
     st = _ler_json(nuvem / "nuvem_status.json") or {}
     nuvem_em = int(st.get("nuvem_em") or 0)
     ultimo_imp = int(postagem.fila.get("nuvem_importado_em") or _estado_sync["importado_em"] or 0)
     if not nuvem_em or nuvem_em <= ultimo_imp:
-        return False
+        return False, True
 
     for nome in ARQUIVOS_JSON:
-        _rclone_cmd("copyto", f"gdrive:Non Shop/001/_kakashi_nuvem/{nome}", str(nuvem / nome), timeout=20)
+        _rclone_cmd("copyto", f"{GDRIVE_NUVEM}/{nome}", str(nuvem / nome), timeout=20)
 
     mudou = False
     fila_nuvem = _ler_json(nuvem / "fila.json")
@@ -83,13 +95,16 @@ def importar_da_nuvem() -> bool:
                 if iid in por_id:
                     loc = por_id[iid]
                     if item_n.get("resultados") and item_n.get("resultados") != loc.get("resultados"):
-                        loc["resultados"] = item_n["resultados"]
+                        loc.setdefault("resultados", {}).update(item_n["resultados"])
                         loc["status"] = item_n.get("status", loc["status"])
                         loc["andamento"] = ""
                         mudou = True
                     elif item_n.get("status") == "postado" and loc.get("status") != "postado":
                         loc["status"] = "postado"
                         loc["andamento"] = ""
+                        mudou = True
+                    if item_n.get("quando") and item_n.get("quando") > (loc.get("quando") or 0) and loc.get("status") == "agendado":
+                        loc["quando"] = item_n["quando"]
                         mudou = True
                 else:
                     v_src = nuvem / "videos" / item_n.get("arquivo", "")
@@ -131,15 +146,15 @@ def importar_da_nuvem() -> bool:
 
     if mudou:
         postagem._log("Nuvem: postagens e leituras feitas enquanto o PC dormia foram sincronizadas.")
-    return mudou
+    return mudou, True
 
 
 def exportar_para_nuvem(forcar: bool = False) -> None:
     """Write PC heartbeat and copy updated JSONs + pending video files to Google Drive (_kakashi_nuvem)."""
     agora = time.time()
+    gap_sono = agora - _estado_sync["ultimo"] > 120
     if not forcar and agora - _estado_sync["ultimo"] < INTERVALO_SYNC_S:
         return
-    _estado_sync["ultimo"] = agora
     nuvem = pasta_nuvem()
     if not nuvem:
         return
@@ -148,7 +163,14 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
     except OSError:
         return
 
-    importar_da_nuvem()
+    # If the PC just started or woke up from sleep/hibernation, require a remote check of nuvem_status.json
+    # BEFORE exporting local fila.json so we never overwrite cloud work while Wi-Fi is still reconnecting.
+    precisa_rede = forcar or gap_sono or not _estado_sync["checou_nuvem"]
+    _, rede_ok = importar_da_nuvem(exigir_rede=precisa_rede)
+    if not rede_ok:
+        return
+    _estado_sync["checou_nuvem"] = True
+    _estado_sync["ultimo"] = agora
 
     _gravar_json(nuvem / "heartbeat_pc.json", {"em": int(agora), "hora": time.strftime("%Y-%m-%d %H:%M:%S")})
 
@@ -170,6 +192,22 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
             except OSError:
                 pass
 
+    # Push top-level JSONs + heartbeat_pc.json FIRST (fast, 2s) and NEVER overwrite nuvem_status.json from PC
+    sincronizar_rclone = forcar or mudou_json or agora - _estado_sync["ultimo_rclone"] >= 120
+    if sincronizar_rclone:
+        _rclone_cmd(
+            "copy",
+            str(nuvem),
+            GDRIVE_NUVEM,
+            "--max-depth",
+            "1",
+            "--exclude",
+            "*.tmp",
+            "--exclude",
+            "nuvem_status.json",
+            timeout=25,
+        )
+
     v_nuvem = nuvem / "videos"
     try:
         v_nuvem.mkdir(parents=True, exist_ok=True)
@@ -182,13 +220,14 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
             if i.get("arquivo") and i.get("status") in ("preparando", "rascunho", "agendado", "postando")
             and any(d not in i.get("resultados", {}) for d in i.get("destinos", []))
         }
+    mudou_videos = False
     for arq in pendentes:
         src_v = postagem.VIDEOS / arq
         dst_v = v_nuvem / arq
         if src_v.is_file() and not dst_v.is_file():
             try:
                 shutil.copy2(src_v, dst_v)
-                mudou_json = True
+                mudou_videos = True
             except OSError:
                 pass
     try:
@@ -201,9 +240,9 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
     except OSError:
         pass
 
-    if forcar or mudou_json or agora - _estado_sync["ultimo_rclone"] >= 120:
+    if sincronizar_rclone or mudou_videos:
         _estado_sync["ultimo_rclone"] = agora
-        _rclone_cmd("copy", str(nuvem), "gdrive:Non Shop/001/_kakashi_nuvem", "--exclude", "*.tmp", timeout=45)
+        _rclone_cmd("copy", str(v_nuvem), f"{GDRIVE_NUVEM}/videos", "--exclude", "*.tmp", timeout=120)
 
 
 def passo_worker() -> None:

@@ -8,16 +8,20 @@ on:
       forcar:
         description: 'Rodar mesmo com o PC ligado (teste)'
         required: false
-        default: '1'
+        default: '0'
+
+permissions:
+  actions: write
+  contents: read
 
 concurrency:
   group: kakashi-nuvem
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   postar-e-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 180
     env:
       TZ: America/Sao_Paulo
       POSTAGEM_DIR: ${{ github.workspace }}/output/postagem
@@ -51,7 +55,7 @@ jobs:
           import json, os, time
           from pathlib import Path
           hb_path = Path(os.environ["POSTAGEM_DIR"]) / "heartbeat_pc.json"
-          forcar = os.environ.get("FORCAR_NUVEM") == "1" or os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+          forcar = os.environ.get("FORCAR_NUVEM") == "1"
           ativo = False
           if hb_path.is_file() and not forcar:
               try:
@@ -100,3 +104,30 @@ jobs:
               rclone copyto "$POSTAGEM_DIR/$arq" "gdrive:Non Shop/001/_kakashi_nuvem/$arq"
             fi
           done
+
+      - name: Auto-encadear proxima execucao se ainda restarem videos devidos na fila
+        if: steps.check_pc.outputs.pc_ativo != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import json, os, subprocess, sys, time
+          sys.path.insert(0, "tools/clone")
+          import postagem
+          agora = time.time()
+          hb_path = postagem.DIR / "heartbeat_pc.json"
+          if hb_path.is_file():
+              try:
+                  hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                  if 0 <= int(agora) - int(hb.get("em") or 0) < 300:
+                      raise SystemExit(0)
+              except Exception:
+                  pass
+          restam = any(
+              i.get("status") == "agendado" and postagem._devidos(i, agora + 300)
+              for i in postagem.fila.get("itens", [])
+          )
+          if restam:
+              print("Ainda ha videos devidos na fila; disparando proxima execucao automatica...")
+              subprocess.run(["gh", "workflow", "run", "kakashi-nuvem.yml", "-f", "forcar=0"], check=False)
+          EOF

@@ -876,6 +876,7 @@ def _fontes_kakashi() -> list[tuple[str, Path]]:
                 out += [("kakashi", v) for v in (c / "final").glob("final_*.mp4") if v.name != "final_sem_legenda.mp4"]
     out += [("tela_dividida", v) for v in (OUTPUT / "tela_dividida" / "saidas").glob("*.mp4")]
     out += [("clickbait", v) for v in (OUTPUT / "clickbait" / "saidas").glob("*.mp4")]
+    out += [("lipsync", v) for v in (OUTPUT / "lipsync" / "saidas").glob("*.mp4") if not v.stem.endswith("_sem_legenda")]
     return out
 
 
@@ -1121,7 +1122,8 @@ def _janela(dia: datetime) -> tuple[float, float]:
 def _mesmo_dia_roleta(a: float, b: float) -> bool:
     """Both times in the same Roleta day (a post until FIM_DO_DIA_H belongs to the day before)."""
     dia = lambda t: time.strftime("%Y-%m-%d", time.localtime(t - FIM_DO_DIA_H * 3600))
-    return dia(a) == dia(b)
+    cal = lambda t: time.strftime("%Y-%m-%d", time.localtime(t))
+    return dia(a) == dia(b) or cal(a) == cal(b)
 
 
 def _da_pagina(pid: str, de: float, ate: float) -> list[dict]:
@@ -1971,9 +1973,21 @@ def _sincronizar_nuvem(forcar: bool = False) -> None:
         pass
 
 
+def _manter_acordado() -> None:
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        with lock:
+            tem_pendente = any(i['status'] == 'agendado' and _restantes(i) for i in fila['itens'])
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001 if tem_pendente else 0x80000000)
+    except Exception:
+        pass
+
+
 def _worker() -> None:
     while True:
-        for passo in (_sincronizar_nuvem, _checar_tokens, _auto_paginas, _scan_entrada, _scan_drive, _scan_kakashi,
+        for passo in (_manter_acordado, _sincronizar_nuvem, _checar_tokens, _auto_paginas, _scan_entrada, _scan_drive, _scan_kakashi,
                       _repor_auto, _postar_devidos, _acompanhar_meta, _conferir_meta, _limpar_postados):
             try:
                 passo()
