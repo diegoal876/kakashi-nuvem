@@ -94,7 +94,7 @@ fila["config"].setdefault("destinos_padrao", [])
 fila["config"].setdefault("pasta_drive", os.environ.get("POSTAGEM_DRIVE", r"G:\Meu Drive\Postagens"))
 fila["config"].setdefault("drive_ig", False)
 fila.setdefault("drive_vistos", {})  # path inside the Drive folder -> [size, mtime] already copied
-fila["config"].setdefault("horarios_padrao", ["10:00", "15:00", "20:00"])  # posting times of every Page...
+fila["config"].setdefault("horarios_padrao", ["00:00", "03:00", "06:00"])  # posting times of every Page...
 fila["config"].setdefault("horarios_paginas", {})  # ...unless it has its own: page id -> times
 fila["config"].setdefault("rodizio", [])  # page ids the _Rodízio folder shares its videos among
 fila["config"].setdefault("avatar_paginas", None)  # avatar number -> page id; None until learned from the history
@@ -263,10 +263,39 @@ AVATAR_DIR_PADRAO = Path(os.environ.get("AVATAR_DIR", r"C:\Users\diego\Downloads
 AVATAR_DRIVE_PADRAO = Path(os.environ.get("AVATAR_DRIVE_DIR", r"G:\Meu Drive\Non Shop\001\Avatares"))
 
 
-def _mapa_fotos_avatares() -> dict[int, Path]:
-    """Avatar number -> photo file path (from local avatar folder and Google Drive Avatares folder)."""
-    fotos: dict[int, Path] = {}
+def _idioma(val) -> str:
+    return "es" if str(val or "").strip().lower() == "es" else "en"
+
+
+def _mapa_idiomas_avatares() -> dict[str, str]:
+    """Avatar number (str) -> 'en' | 'es', combining AVATAR_DIR/_idiomas.json and roleta.json."""
+    out: dict[str, str] = {}
+    S = roleta_dados() or {}
+    for avid, a in (S.get("avatares") or {}).items():
+        n = roleta.numero_avatar(S, avid)
+        if n and roleta.idioma_de(a) == "es":
+            out[n] = "es"
     for pasta in (AVATAR_DIR_PADRAO, AVATAR_DRIVE_PADRAO):
+        f_id = pasta / "_idiomas.json"
+        if f_id.is_file():
+            dados = _load(f_id, {})
+            if isinstance(dados, dict):
+                for k, v in dados.items():
+                    ks = str(k).strip().lstrip("0") or "0"
+                    if ks.isdigit():
+                        out[ks] = _idioma(v)
+    return out
+
+
+def _mapa_fotos_avatares(idioma: str = "en") -> dict[int, Path]:
+    """Avatar number -> photo file path, isolated between English (AVATAR_DIR) and Spanish (AVATAR_DIR/es)."""
+    fotos: dict[int, Path] = {}
+    pastas = (
+        (AVATAR_DIR_PADRAO / "es", AVATAR_DRIVE_PADRAO.parent / "Avatares ES")
+        if _idioma(idioma) == "es"
+        else (AVATAR_DIR_PADRAO, AVATAR_DRIVE_PADRAO)
+    )
+    for pasta in pastas:
         if not pasta.is_dir():
             continue
         for f in pasta.iterdir():
@@ -279,12 +308,22 @@ def _mapa_fotos_avatares() -> dict[int, Path]:
 
 def _perfis_lista(c: dict) -> list[dict]:
     """Connected Facebook profiles (AdsPower accounts). Migrates legacy single token_usuario on the fly."""
-    perfis = [dict(pf) for pf in (c.get("perfis") or []) if isinstance(pf, dict) and pf.get("token_usuario")]
+    perfis = []
+    for pf in (c.get("perfis") or []):
+        if isinstance(pf, dict) and pf.get("token_usuario"):
+            d = dict(pf)
+            d["idioma"] = _idioma(d.get("idioma"))
+            d.setdefault("app_id", c.get("app_id", ""))
+            d.setdefault("app_secret", c.get("app_secret", ""))
+            perfis.append(d)
     if not perfis and c.get("token_usuario"):
         perfis.append({
             "id": c.get("usuario_id") or "principal",
             "nome": c.get("usuario_nome") or "Conta Principal",
             "rotulo": c.get("usuario_rotulo") or "Conta de postagem dos videos",
+            "idioma": "en",
+            "app_id": c.get("app_id", ""),
+            "app_secret": c.get("app_secret", ""),
             "token_usuario": c["token_usuario"],
             "token_vence": c.get("token_vence", 0),
             "longo": bool(c.get("longo", False)),
@@ -317,14 +356,20 @@ def _buscar_paginas(token: str) -> list[dict]:
     return paginas
 
 
-def _mesclar_pagina(antiga: dict | None, nova: dict, perfil_id: str = "", rotulo: str = "") -> dict:
-    """Keep local metadata (configurada, avatar_foto, criada_em) when refreshing a Page from Meta."""
+def _mesclar_pagina(antiga: dict | None, nova: dict, perfil_id: str = "", rotulo: str = "", idioma: str | None = None, forcar_idioma: bool = False) -> dict:
+    """Keep local metadata (configurada, avatar_foto, criada_em, idioma) when refreshing a Page from Meta."""
     base = dict(antiga or {})
     base.update(nova)
     if perfil_id:
         base["perfil_id"] = perfil_id
     if rotulo:
         base["perfil_rotulo"] = rotulo
+    if forcar_idioma and idioma:
+        base["idioma"] = _idioma(idioma)
+    elif idioma and not base.get("idioma"):
+        base["idioma"] = _idioma(idioma)
+    else:
+        base["idioma"] = _idioma(base.get("idioma"))
     if base.get("bio") and not base.get("sem_foto", False):
         base.setdefault("configurada", True)
     return base
@@ -363,7 +408,8 @@ def _roleta_entrar(paginas: list[dict], antes: set[str]) -> list[str]:
                 continue
             ordem += 1
             S["paginas"][f"fb{p['id']}"] = {
-                "nome": p["nome"], "fase": 1, "ordem": ordem, "criadaEm": datetime.now().date().isoformat(),
+                "nome": p["nome"], "idioma": _idioma(p.get("idioma")), "fase": 1, "ordem": ordem,
+                "criadaEm": datetime.now().date().isoformat(),
                 "formatoFixo": "", "avatarOficial": None, "formatoViral": "", "novoViral": "", "historico": []}
             entram.append(p["nome"])
         if entram:
@@ -394,7 +440,8 @@ def atualizar_paginas(_body: dict | None = None) -> str:
             perfis_lidos.add(pf.get("id") or "")
             for p in lote:
                 por_id[p["id"]] = _mesclar_pagina(por_id.get(p["id"]) or antes.get(p["id"]), p,
-                                                  pf.get("id", ""), pf.get("rotulo") or pf.get("nome", ""))
+                                                  pf.get("id", ""), pf.get("rotulo") or pf.get("nome", ""),
+                                                  idioma=pf.get("idioma") or "en")
         except (GraphError, Recusa) as e:
             erros_pf.append(f"{pf.get('rotulo') or pf.get('nome') or 'Perfil'}: {e}")
     if not por_id and erros_pf:
@@ -426,15 +473,23 @@ def atualizar_paginas(_body: dict | None = None) -> str:
 
 def conectar(body: dict) -> str:
     """User token (Graph API Explorer) -> the Pages it manages, each with its own token and linked Instagram.
-    Supports Multi-Perfil (AdsPower): by default ('somar') merges the new profile's Pages with existing profiles."""
+    Supports Multi-Perfil (AdsPower) with isolated per-profile Meta App ID / Secret and language ('en' or 'es')."""
     token = str(body.get("token") or "").strip()
     if not token:
         raise Recusa("Cole o token de usuario.")
     atual = contas()
-    app_id = str(body.get("app_id") or "").strip() or atual.get("app_id", "")
-    secret = str(body.get("app_secret") or "").strip() or atual.get("app_secret", "")
+    perfis_atuais = _perfis_lista(atual)
     rotulo = str(body.get("rotulo") or "").strip()
     modo = str(body.get("modo") or "somar").strip().lower()
+    tem_idioma_body = "idioma" in body and str(body.get("idioma") or "").strip() != ""
+    idioma = _idioma(body.get("idioma")) if tem_idioma_body else "en"
+    app_id_in = str(body.get("app_id") or "").strip()
+    secret_in = str(body.get("app_secret") or "").strip()
+    pf_ref = next((pf for pf in perfis_atuais if (rotulo and pf.get("rotulo", "").lower() == rotulo.lower())
+                   or (app_id_in and pf.get("app_id") == app_id_in)), None)
+    app_id = app_id_in or (pf_ref.get("app_id", "") if pf_ref else "") or (atual.get("app_id", "") if idioma == "en" else "")
+    secret = secret_in or (pf_ref.get("app_secret", "") if pf_ref and (not app_id_in or app_id_in == pf_ref.get("app_id")) else "") or (
+        atual.get("app_secret", "") if app_id == atual.get("app_id", "") else "")
     longo, vence = False, int(time.time()) + 3600
     if app_id and secret:
         r = _http("GET", f"{GRAPH}/{VERSAO}/oauth/access_token?" + urlencode(
@@ -456,17 +511,18 @@ def conectar(body: dict) -> str:
     agora = int(time.time())
     antes_map = {p["id"]: p for p in atual.get("paginas", [])}
     ja = set(antes_map)
-    perfis_atuais = _perfis_lista(atual)
     if len(perfis_atuais) == 1:
         pf0 = perfis_atuais[0]
         for p in antes_map.values():
             p.setdefault("perfil_id", pf0.get("id", "principal"))
             p.setdefault("perfil_rotulo", pf0.get("rotulo") or pf0.get("nome", "Conta principal"))
-    novo_pf = {"id": me_id, "nome": me_nome, "rotulo": rotulo_final, "token_usuario": token,
+            p.setdefault("idioma", _idioma(pf0.get("idioma")))
+    novo_pf = {"id": me_id, "nome": me_nome, "rotulo": rotulo_final, "idioma": idioma,
+               "app_id": app_id, "app_secret": secret, "token_usuario": token,
                "token_vence": vence, "longo": longo, "conectado_em": agora}
     if modo == "substituir" or not perfis_atuais:
         perfis_finais = [novo_pf]
-        paginas = [_mesclar_pagina(antes_map.get(p["id"]), p, me_id, rotulo_final) for p in lote]
+        paginas = [_mesclar_pagina(antes_map.get(p["id"]), p, me_id, rotulo_final, idioma=idioma, forcar_idioma=True) for p in lote]
     else:
         perfis_finais = []
         trocou = False
@@ -474,6 +530,13 @@ def conectar(body: dict) -> str:
             if pf.get("id") == me_id or (rotulo and pf.get("rotulo", "").lower() == rotulo.lower()) or (
                     pf.get("id") == "principal" and len(perfis_atuais) == 1 and any(p["id"] in ja for p in lote)):
                 novo_pf["rotulo"] = rotulo or pf.get("rotulo") or me_nome
+                if not tem_idioma_body:
+                    idioma = _idioma(pf.get("idioma"))
+                    novo_pf["idioma"] = idioma
+                if not app_id:
+                    novo_pf["app_id"] = pf.get("app_id", "")
+                if not secret:
+                    novo_pf["app_secret"] = pf.get("app_secret", "")
                 rotulo_final = novo_pf["rotulo"]
                 perfis_finais.append(novo_pf)
                 trocou = True
@@ -483,10 +546,13 @@ def conectar(body: dict) -> str:
             perfis_finais.append(novo_pf)
         por_id = dict(antes_map)
         for p in lote:
-            por_id[p["id"]] = _mesclar_pagina(por_id.get(p["id"]), p, me_id, rotulo_final)
+            por_id[p["id"]] = _mesclar_pagina(por_id.get(p["id"]), p, me_id, rotulo_final, idioma=idioma, forcar_idioma=tem_idioma_body)
         paginas = list(por_id.values())
     melhor_pf = max(perfis_finais, key=lambda x: x.get("token_vence", 0))
-    _write(CONTAS_FILE, {"app_id": app_id, "app_secret": secret, "longo": bool(melhor_pf.get("longo")),
+    pf_base = perfis_finais[0]
+    _write(CONTAS_FILE, {"app_id": pf_base.get("app_id") or atual.get("app_id", "") or app_id,
+                         "app_secret": pf_base.get("app_secret") or atual.get("app_secret", "") or secret,
+                         "longo": bool(melhor_pf.get("longo")),
                          "conectado_em": agora, "token_usuario": melhor_pf["token_usuario"],
                          "token_vence": melhor_pf["token_vence"], "perfis": perfis_finais, "paginas": paginas})
     with lock:  # Meta answered, so whatever block there was is over
@@ -597,7 +663,8 @@ def configurar_paginas_massa(body: dict) -> str:
     c = contas()
     paginas = c.get("paginas", [])
     por_id = {p["id"]: p for p in paginas}
-    fotos_av = _mapa_fotos_avatares()
+    fotos_av_en = _mapa_fotos_avatares("en")
+    fotos_av_es = _mapa_fotos_avatares("es")
     n_foto, n_bio, n_cfg = 0, 0, 0
     erros_api = []
     alvos_pags = []
@@ -637,7 +704,8 @@ def configurar_paginas_massa(body: dict) -> str:
             if cand.is_file():
                 img_path = cand
         elif av_num is not None and str(av_num).strip().isdigit():
-            img_path = fotos_av.get(int(av_num))
+            mapa_lang = fotos_av_es if _idioma(p.get("idioma")) == "es" else fotos_av_en
+            img_path = mapa_lang.get(int(av_num))
         if img_path:
             try:
                 fez_chamada_meta = True
@@ -703,6 +771,52 @@ def configurar_paginas_massa(body: dict) -> str:
     return resumo
 
 
+def definir_idioma(body: dict) -> str:
+    """Change the language ('en' or 'es') of a connected Facebook profile or a single Page, keeping Roleta in sync."""
+    lang = _idioma(body.get("idioma"))
+    pf_id = str(body.get("perfil_id") or "").strip()
+    pg_id = str(body.get("pagina_id") or "").strip()
+    c = contas()
+    perfis = _perfis_lista(c)
+    paginas = c.get("paginas", [])
+    afetadas = set()
+    if pf_id:
+        for pf in perfis:
+            if pf.get("id") == pf_id:
+                pf["idioma"] = lang
+        for p in paginas:
+            if p.get("perfil_id") == pf_id or (len(perfis) == 1 and pf_id == perfis[0].get("id")):
+                p["idioma"] = lang
+                afetadas.add(p["id"])
+    elif pg_id:
+        for p in paginas:
+            if p["id"] == pg_id:
+                p["idioma"] = lang
+                afetadas.add(p["id"])
+    else:
+        raise Recusa("Informe o perfil ou a Pagina para mudar o idioma.")
+    c.update(perfis=perfis, paginas=paginas)
+    _write(CONTAS_FILE, c)
+    if afetadas:
+        with roleta_lock:
+            S = roleta_dados()
+            if S:
+                # Match across all languages before flipping so existing Roleta entry updates cleanly
+                todas_r = roleta.paginas(S)
+                casadas_todas = roleta._casar_grupo(todas_r, paginas)
+                mudou_r = False
+                for rid, fbid in casadas_todas.items():
+                    if fbid in afetadas and S["paginas"].get(rid, {}).get("idioma") != lang:
+                        S["paginas"][rid]["idioma"] = lang
+                        mudou_r = True
+                if mudou_r:
+                    S["alterada_em"] = int(time.time())
+                    _write(ROLETA_FILE, S)
+    wake.set()
+    nome_lang = "🇪🇸 Espanhol (ES)" if lang == "es" else "🇺🇸 Inglês (EN)"
+    return f"{len(afetadas)} Página(s) marcada(s) como {nome_lang}."
+
+
 def contas_publico() -> dict:
     c = contas()
     pags = c.get("paginas", [])
@@ -722,6 +836,9 @@ def contas_publico() -> dict:
             "id": pf.get("id", ""),
             "nome": pf.get("nome", ""),
             "rotulo": pf.get("rotulo") or pf.get("nome") or "Perfil Facebook",
+            "idioma": _idioma(pf.get("idioma")),
+            "app_id": pf.get("app_id", ""),
+            "tem_secret": bool(pf.get("app_secret")),
             "conectado_em": pf.get("conectado_em", 0),
             "token_vence": pf.get("token_vence", 0),
             "longo": bool(pf.get("longo", False)),
@@ -730,6 +847,7 @@ def contas_publico() -> dict:
         "paginas": [{
             "id": p["id"],
             "nome": p["nome"],
+            "idioma": _idioma(p.get("idioma")),
             "ig_id": p.get("ig_id", ""),
             "ig_nome": p.get("ig_nome", ""),
             "perfil_id": p.get("perfil_id", ""),
@@ -815,16 +933,18 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:50] or "video"
 
 
-def adicionar(src: Path, origem: str, nome: str, mover=False, destinos=None, legenda="", quando=None) -> dict:
+def adicionar(src: Path, origem: str, nome: str, mover=False, destinos=None, legenda="", quando=None, idioma: str | None = None) -> dict:
     """Copy (or move) a video into the queue as a draft; checking and converting run in the background."""
     VIDEOS.mkdir(parents=True, exist_ok=True)
     with lock:
         seq = fila["seq"] = fila["seq"] + 1
     dest = VIDEOS / f"{seq:04d}_{_slug(Path(nome).stem)}{src.suffix.lower()}"
     (shutil.move if mover else shutil.copy2)(str(src), str(dest))
-    item = {"id": seq, "origem": origem, "nome": nome, "arquivo": dest.name, "fonte": "" if mover else str(src),
+    dest_list = list(destinos or [])
+    lang = _idioma(idioma) if idioma in ("en", "es") else _idioma_video(nome, origem, dest_list)
+    item = {"id": seq, "origem": origem, "nome": nome, "idioma": lang, "arquivo": dest.name, "fonte": "" if mover else str(src),
             "legenda": legenda,
-            "destinos": list(destinos or []), "quando": quando,  # no Page until the user picks one (or its Drive folder says)
+            "destinos": dest_list, "quando": quando,  # no Page until the user picks one (or its Drive folder says)
             "status": "preparando", "andamento": "Conferindo o video...", "resultados": {}, "info": {},
             "avisos": [], "erro": "", "criado": int(time.time())}
     with lock:
@@ -963,7 +1083,9 @@ def _pastas_paginas() -> dict[str, dict]:
     return {(n if nomes.count(n) == 1 else f"{n} ({p['id']})"): p for n, p in zip(nomes, paginas)}
 
 
-RODIZIO = "_Rodízio"  # Drive subfolder whose videos are shared among the Pages in fila["config"]["rodizio"]
+RODIZIO = "_Rodízio"  # English rotation folder
+RODIZIO_ES = "_Rodízio ES"  # Spanish rotation folder
+RODIZIO_IDIOMAS = {RODIZIO: "en", "_Rodizio": "en", RODIZIO_ES: "es", "_Rodizio ES": "es", "_Rodízio_ES": "es", "_Rodizio_ES": "es"}
 LEIA_ME = """COMO ORGANIZAR OS VÍDEOS PARA POSTAGEM
 ======================================
 
@@ -1003,7 +1125,7 @@ def criar_pastas_drive() -> int | None:
             return None
         base.mkdir()
     novas = 0
-    for nome in [*_pastas_paginas(), RODIZIO]:
+    for nome in [*_pastas_paginas(), RODIZIO, RODIZIO_ES]:
         if not (base / nome).is_dir():
             (base / nome).mkdir()
             novas += 1
@@ -1110,7 +1232,7 @@ def roleta_gravar(body: dict) -> dict:
     return {"versao": versao}
 
 
-FIM_DO_DIA_H = 6  # a Roleta day's posts may run until 6h the next morning
+FIM_DO_DIA_H = 0  # Roleta day aligns with calendar day starting at 00:00
 INTERVALO_PAGINA_S = 3 * 3600  # between two posts of the same Page
 
 
@@ -1164,40 +1286,80 @@ def _no_dia(pid: str, dia: datetime) -> list[dict]:
 
 def _cabe(S: dict, rid: str, pid: str, dia: datetime, n: str | None = None) -> bool:
     """With n, one of the Page's avatars of that day: it has room for its own video (1 in phases 1-2, 3 for the official
-    one), whatever else went out on the Page that day (a video left over from the day before, a split screen), so the
-    day's batch always gets its places. Without n, a video of an avatar the Roleta left without a Page: it only takes a
-    place the Page still has that day."""
+    one), up to the Page's daily limit (por_pagina). Without n, a video of an avatar the Roleta left without a Page:
+    it only takes a place the Page still has that day after reserving its own Roleta avatars."""
     por_avatar, por_pagina = COTA_FASE.get(S["paginas"].get(rid, {}).get("fase"), COTA_PADRAO)
     itens = _no_dia(pid, dia)
+    if len(itens) >= por_pagina:
+        return False
     if n is not None:
         return sum(1 for i in itens if _avatar(i["nome"]) == n) < por_avatar
-    return len(itens) < por_pagina
+    return True
 
 
-def _vaga_sem_pagina(S: dict, casadas: dict, dia: datetime, agora: float) -> tuple[dict, int] | None:
-    """An avatar the Roleta leaves without a Page that day: the Page of phases 1-2 with the fewest posts in that
-    Roleta day that still has room and a free time (3h from its other posts, until 6h the next morning)."""
-    livres = [(rid, p) for rid, pid in casadas.items() if S["paginas"].get(rid, {}).get("fase") != 3
+def _idioma_video(nome: str, origem: str = "", destinos: list[str] | None = None, S: dict | None = None) -> str:
+    """Infer 'en' or 'es' for a video from its Drive folder (_Rodízio ES), destination Page, lipsync origin, or avatar."""
+    seg0 = str(nome or "").replace("\\", "/").split("/", 1)[0]
+    if seg0 in RODIZIO_IDIOMAS:
+        return RODIZIO_IDIOMAS[seg0]
+    if destinos:
+        pag = _pagina(str(destinos[0]).partition(":")[2])
+        if pag:
+            return _idioma(pag.get("idioma"))
+    if origem == "lipsync" or "avatar_es" in str(nome or "").lower() or re.search(r"(?:^|[_\s.-])es(?:\.[a-z0-9]+)?$", str(nome or ""), re.I):
+        return "es"
+    n = _avatar(str(nome or ""))
+    if n:
+        mapa_id = _mapa_idiomas_avatares()
+        if mapa_id.get(n) == "es":
+            return "es"
+        S_use = S if S is not None else roleta_dados()
+        if S_use:
+            langs = {roleta.idioma_de(a) for avid, a in (S_use.get("avatares") or {}).items() if roleta.numero_avatar(S_use, avid) == n}
+            if langs == {"es"}:
+                return "es"
+    return "en"
+
+
+def _vaga_sem_pagina(S: dict, casadas: dict, dia: datetime, agora: float, idioma: str = "en") -> tuple[dict, int] | None:
+    """An avatar the Roleta leaves without a Page that day: the Page of phases 1-2 (of the same language) with the
+    fewest posts in that Roleta day (counting slots reserved by its own Roleta avatars) that still has room."""
+    lang = _idioma(idioma)
+    plano_dia = roleta.plano(S, dia.date().isoformat(), idioma=lang)
+    livres = [(rid, p) for rid, pid in casadas.items()
+              if roleta.idioma_de(S["paginas"].get(rid)) == lang
+              and S["paginas"].get(rid, {}).get("fase") != 3
               and not S["paginas"].get(rid, {}).get("pausada") and (p := _pagina(pid))]
-    for rid, p in sorted(livres, key=lambda x: len(_no_dia(x[1]["id"], dia))):
+
+    def _ocupacao(item_rp: tuple[str, dict]) -> tuple[int, int, int]:
+        rid, p = item_rp
+        itens = _no_dia(p["id"], dia)
+        meus = {roleta.numero_avatar(S, a) for a in plano_dia.get(rid, []) if a}
+        faltam_meus = sum(1 for m in meus if m and sum(1 for i in itens if _avatar(i["nome"]) == m) == 0)
+        return (len(itens) + faltam_meus, len(itens), S["paginas"].get(rid, {}).get("prioridade") or 999)
+
+    for rid, p in sorted(livres, key=_ocupacao):
+        por_pagina = COTA_FASE.get(S["paginas"].get(rid, {}).get("fase"), COTA_PADRAO)[1]
+        if _ocupacao((rid, p))[0] >= por_pagina:
+            continue
         if _cabe(S, rid, p["id"], dia) and (t := _vaga_no_dia(p["id"], dia, agora)):
             return p, t
     return None
 
 
-def _vaga_roleta(nome: str) -> tuple[dict, int] | None:
-    """For an "Avatar N" video: the Page that avatar has on the Roleta, on the first day (from today) that Page still
-    has room (see COTA_FASE), 3 hours from the Page's other posts and no later than 6h the next morning. A day the
-    Roleta leaves the avatar without a Page, the video goes to a Page of phases 1-2 with room (_vaga_sem_pagina)."""
+def _vaga_roleta(nome: str, idioma: str | None = None) -> tuple[dict, int] | None:
+    """For an "Avatar N" video: the Page that avatar has on the Roleta (strictly matching its language 'en' or 'es'),
+    on the first day (from today) that Page still has room (see COTA_FASE)."""
     S, n = roleta_dados(), _avatar(nome)
     if not S or not n:
         return None
-    casadas, agora = roleta.casar_paginas(S, contas().get("paginas", [])), time.time()
+    lang = _idioma(idioma) if idioma in ("en", "es") else _idioma_video(nome, S=S)
+    casadas, agora = roleta.casar_paginas(S, contas().get("paginas", []), idioma=lang), time.time()
     for dia in _dias():
-        rid = roleta.avatar_para_pagina(S, dia.date().isoformat()).get(n)
+        rid = roleta.avatar_para_pagina(S, dia.date().isoformat(), idioma=lang).get(n)
         pagina = _pagina(casadas.get(rid, ""))
         if not pagina:
-            if lugar := _vaga_sem_pagina(S, casadas, dia, agora):
+            if lugar := _vaga_sem_pagina(S, casadas, dia, agora, idioma=lang):
                 return lugar
             continue
         if _cabe(S, rid, pagina["id"], dia, n) and (t := _vaga_no_dia(pagina["id"], dia, agora)):
@@ -1205,9 +1367,11 @@ def _vaga_roleta(nome: str) -> tuple[dict, int] | None:
     return None
 
 
-def _escolher_rodizio() -> dict | None:
-    """The rotation Page with the fewest videos waiting in the queue (then the fewest received so far)."""
+def _escolher_rodizio(idioma: str | None = None) -> dict | None:
+    """The rotation Page with the fewest videos waiting in the queue (filtered by language when given)."""
     paginas = [p for p in (_pagina(pid) for pid in fila["config"]["rodizio"]) if p]
+    if idioma in ("en", "es"):
+        paginas = [p for p in paginas if _idioma(p.get("idioma")) == idioma]
     if not paginas:
         return None
     vivos = ("preparando", "rascunho", "agendado")
@@ -1219,7 +1383,7 @@ def _escolher_rodizio() -> dict | None:
     return p
 
 
-AVATAR_RE = re.compile(r"avatar[\s_-]*0*(\d+)", re.I)
+AVATAR_RE = re.compile(r"avatar(?:[\s_-]*es)?[\s_-]*0*(\d+)", re.I)
 COPIA_RE = re.compile(r"\bcopy\s*(\d+)", re.I)  # the Drive has both "copy 28" and "copy29"
 NUMERO_RE = re.compile(r"^(?:final_download_)?0*(\d+)(?: \(\d+\))?$")  # "12.mp4", "final_download_12", "4 (2)"
 
@@ -1264,21 +1428,29 @@ def _destinos_drive(pagina: dict) -> list[str]:
 
 
 def roleta_publica() -> dict | None:
-    """Today's Roleta for the page: each of its Pages, the connected Page it matched, and its avatar numbers."""
+    """Active day's Roleta for the page: uses the day of the current pending queue (or today if empty)."""
     S = roleta_dados()
     if not S:
         return None
-    casadas, plano = roleta.casar_paginas(S, contas().get("paginas", [])), roleta.plano(S, datetime.now().date().isoformat())
-    return {"alterada_em": S.get("alterada_em") or S.get("copiada_em", 0), "paginas": [
-        {"nome": p.get("nome", ""), "fase": p.get("fase") or 1, "pagina": casadas.get(p["id"], ""), "pausada": bool(p.get("pausada")),
+    ativos = [i.get("quando") for i in fila.get("itens", []) if i.get("status") in ("rascunho", "agendado") and i.get("quando")]
+    if ativos:
+        datas = [time.strftime("%Y-%m-%d", time.localtime(q - FIM_DO_DIA_H * 3600)) for q in ativos]
+        data_ref = Counter(datas).most_common(1)[0][0]
+    else:
+        data_ref = datetime.now().date().isoformat()
+    casadas, plano = roleta.casar_paginas(S, contas().get("paginas", [])), roleta.plano(S, data_ref)
+    return {"data": data_ref, "alterada_em": S.get("alterada_em") or S.get("copiada_em", 0), "paginas": [
+        {"nome": p.get("nome", ""), "idioma": roleta.idioma_de(p), "fase": p.get("fase") or 1, "pagina": casadas.get(p["id"], ""), "pausada": bool(p.get("pausada")),
          "avatares": [roleta.numero_avatar(S, a) for a in plano.get(p["id"], []) if a]} for p in roleta.paginas(S)]}
 
 
-def _lugar_auto(nome: str) -> tuple[dict, int | None] | None:
+def _lugar_auto(nome: str, idioma: str | None = None) -> tuple[dict, int | None] | None:
     """Where the panel puts an avatar video by itself: the Roleta of the day when there is one, else the fixed map."""
     if roleta_dados():
-        return _vaga_roleta(nome)
+        return _vaga_roleta(nome, idioma=idioma)
     p = _pagina_avatar(nome)
+    if p and idioma in ("en", "es") and _idioma(p.get("idioma")) != idioma:
+        return None
     return (p, proximo_horario(p["id"])) if p else None
 
 
@@ -1294,9 +1466,10 @@ def _aplicar_avatares(refazer=False) -> int:
     for i in rascunhos:
         if i["destinos"]:
             continue
-        lugar = _lugar_auto(i["nome"])
+        lang = i.get("idioma") if i.get("idioma") in ("en", "es") else _idioma_video(i["nome"], i.get("origem", ""))
+        lugar = _lugar_auto(i["nome"], idioma=lang)
         if lugar:
-            i["destinos"], i["quando"], i["auto"] = _destinos_drive(lugar[0]), lugar[1], True
+            i["destinos"], i["quando"], i["auto"], i["idioma"] = _destinos_drive(lugar[0]), lugar[1], True, _idioma(lugar[0].get("idioma"))
             n += 1
     return n
 
@@ -1396,11 +1569,12 @@ def _scan_drive() -> None:
         if not st.st_size or _drive_marcas.get(rel) != marca:
             vivos[rel] = marca
             continue
-        rodizio = f.parent.name == RODIZIO
+        idioma_rod = RODIZIO_IDIOMAS.get(f.parent.name) if f.parent != base else None
+        rodizio = idioma_rod is not None
         na_pasta = f.parent != base and not rodizio  # a Page's folder decides, whatever the name says
         with lock:
             repetido = _ja_na_fila(f.name, st.st_size)
-            lugar = None if na_pasta else _lugar_auto(f.name)
+            lugar = None if na_pasta else _lugar_auto(f.name, idioma=idioma_rod)
             pagina = pastas.get(f.parent.name) if na_pasta else lugar and lugar[0]
             por_avatar = bool(pagina) and not na_pasta
             if repetido:  # moved to another folder: no second copy, but a Page it now has fills an empty draft
@@ -1409,17 +1583,19 @@ def _scan_drive() -> None:
                     repetido["destinos"] = _destinos_drive(pagina)
                     repetido["quando"] = lugar[1] if lugar else proximo_horario(pagina["id"])
                     repetido["auto"] = not na_pasta
+                    repetido["idioma"] = _idioma(pagina.get("idioma"))
                 _salvar()
                 continue
             if not pagina and rodizio:
-                pagina = _escolher_rodizio()
+                pagina = _escolher_rodizio(idioma=idioma_rod)
             destinos, quando = [], None
             if pagina:
                 destinos = _destinos_drive(pagina)  # the time is a suggestion: the video still comes in as a draft
                 quando = lugar[1] if por_avatar else proximo_horario(pagina["id"])
             nome = rel  # the Page shows on the card and can change with the Roleta, so it stays out of the name
+            lang_item = _idioma(pagina.get("idioma")) if pagina else (idioma_rod or _idioma_video(rel, "drive"))
         try:  # outside the lock: a copy from Drive can take a while
-            novo = adicionar(f, "drive", nome, destinos=destinos, legenda=_legenda_drive(f), quando=quando)
+            novo = adicionar(f, "drive", nome, destinos=destinos, legenda=_legenda_drive(f), quando=quando, idioma=lang_item)
         except OSError as e:  # still downloading from Drive, or locked
             _log(f"Nao consegui copiar do Drive {rel}: {e}")
             continue
@@ -1683,15 +1859,16 @@ def _postar_devidos() -> None:
         caidas = (fila.get("tokens_caidos") or {}).get("ids", [])  # those wait for the reconnection, with no error
         alvos = sorted((i.get("quando") or 0, i["id"], d, meta) for i in fila["itens"] if i["status"] == "agendado"
                        for d, meta in _devidos(i, agora) if d.partition(":")[2] not in caidas)
-    for _, iid, dest, meta in alvos[:1]:
+    for _, iid, dest, meta in alvos:
         with lock:
             item = _item(iid)
             if not item or item["status"] != "agendado" or dest in item["resultados"]:
                 continue
             if novo := _respiro(item, dest, agora):
-                item["quando"] = novo
-                _salvar()
-                _log(f"Adiado para {_quando_txt(novo)} · {_nome_destino(dest)} · {item['nome']} · 3h depois do ultimo video da Pagina")
+                if novo != item.get("quando"):
+                    item["quando"] = novo
+                    _salvar()
+                    _log(f"Adiado para {_quando_txt(novo)} · {_nome_destino(dest)} · {item['nome']} · 3h depois do ultimo video da Pagina")
                 continue
             if meta and item.get("quando") and item["quando"] - time.time() < NATIVO_MIN_S:
                 item["quando"] = int(time.time() + NATIVO_MIN_S + 60)
@@ -1751,6 +1928,13 @@ def _postar_devidos() -> None:
                 if not _restantes(item):
                     item["status"] = _status_final(item, time.time())
                 _salvar()
+        if item and res.get("id") and dest.startswith("fb:"):
+            radar_mod = sys.modules.get("radar")
+            if radar_mod and hasattr(radar_mod, "registrar_item"):
+                try:
+                    radar_mod.registrar_item(item, dest, res["id"])
+                except Exception:
+                    pass
         verbo = {"ok": "Postado", "agendado_meta": f"Agendado na Meta para {_quando_txt(quando or 0)}"}.get(
             res["estado"], "ERRO")
         _log(f"{verbo} · {_nome_destino(dest)} · {item['nome'] if item else iid}" +
@@ -1761,6 +1945,7 @@ def _postar_devidos() -> None:
             _bloquear(bloqueio)
         if restrita:
             _pagina_restrita(dest.partition(":")[2], res["erro"])
+        break
 
 
 def _respiro(item: dict, dest: str, agora: float) -> int | None:
@@ -1776,7 +1961,9 @@ def _respiro(item: dict, dest: str, agora: float) -> int | None:
     perto = [t for o in fila["itens"] if o is not item and (t := saiu(o)) and abs(t - q) < INTERVALO_PAGINA_S]
     if not perto:
         return None
-    return int(max(max(perto) + INTERVALO_PAGINA_S, agora + 15 * 60)) // 60 * 60
+    # Round UP to the next full minute (+ 59) so novo - max(perto) is always >= INTERVALO_PAGINA_S
+    novo = ((int(max(max(perto) + INTERVALO_PAGINA_S, agora + 15 * 60)) + 59) // 60) * 60
+    return novo if novo != item.get("quando") else None
 
 
 RESTRICAO_COD = 368  # Meta: "for security reasons your account has limited access for a few days"
@@ -1850,8 +2037,9 @@ def _pagina_restrita(pid: str, erro: str, motivo: str = "a Meta limitou a Págin
                   and not i["andamento"] and any(d.partition(":")[2] == pid for d in i["destinos"])]
         for i in presos:
             i["destinos"], i["quando"] = [], None
+        lang_restrita = _idioma((_pagina(pid) or {}).get("idioma"))
         for i in presos:
-            lugar = _lugar_auto(i["nome"])
+            lugar = _lugar_auto(i["nome"], idioma=i.get("idioma") or lang_restrita)
             if lugar and lugar[1]:
                 i["destinos"], i["quando"] = _destinos_drive(lugar[0]), lugar[1]
                 mudaram += 1
@@ -2080,7 +2268,7 @@ def iniciar() -> None:
             base = _drive()
             for i in fila["itens"]:
                 if (i["origem"] == "drive" and i.get("fonte") and i["status"] in ("preparando", "rascunho")
-                        and not i["resultados"] and Path(i["fonte"]).parent in (base, base / RODIZIO)):
+                        and not i["resultados"] and Path(i["fonte"]).parent in (base, base / RODIZIO, base / RODIZIO_ES)):
                     i["auto"] = True
             fila["config"]["roleta_migrada"] = True
         if roleta_dados():  # on opening, the panel's drafts are placed by today's Roleta and the current rules
@@ -2128,6 +2316,10 @@ def _aplicar(item: dict, body: dict) -> None:
     destinos = _validar_destinos(body.get("destinos"))
     if destinos != item["destinos"] or quando != item["quando"]:
         item.pop("auto", None)  # the user chose: the panel no longer moves it
+    if destinos:
+        pag0 = _pagina(destinos[0].partition(":")[2])
+        if pag0:
+            item["idioma"] = _idioma(pag0.get("idioma"))
     item.update(legenda=legenda, destinos=destinos, quando=quando)
 
 
@@ -2551,14 +2743,16 @@ def _avisos_dia() -> dict[int, list[str]]:
                 out.setdefault(i["id"], []).append(f"Uma copy por Página por dia: {nome} já tem a {antes[1]} em "
                                                    f"{time.strftime('%d/%m', dia)} e este vídeo é a {copia}.")
             if pid in fase1:
-                do_dia.setdefault(data, []).append((i, criativo))
-    for data, lista in do_dia.items():
+                lang_pg = _idioma((_pagina(pid) or {}).get("idioma"))
+                do_dia.setdefault((lang_pg, data), []).append((i, criativo))
+    for (lang_pg, data), lista in do_dia.items():
         if len(lista) < CRIATIVO_MIN_VIDEOS:
             continue
         for criativo, n in Counter(c for _, c in lista).items():
             if 100 * n <= CRIATIVO_MAX_PCT * len(lista):
                 continue
-            texto = (f"{criativo} está em {n} de {len(lista)} vídeos da Fase 1 em {data[8:]}/{data[5:7]}: o limite é "
+            tag_l = " [ES]" if lang_pg == "es" else ""
+            texto = (f"{criativo}{tag_l} está em {n} de {len(lista)} vídeos da Fase 1 em {data[8:]}/{data[5:7]}: o limite é "
                      f"{CRIATIVO_MAX_PCT}%, deixe pelo menos {100 - CRIATIVO_MAX_PCT}% para testar criativos novos.")
             for i, c in lista:
                 if c == criativo and i["status"] in ativos and texto not in out.get(i["id"], []):
@@ -2572,13 +2766,22 @@ def estado() -> dict:
         base = _drive()
         drive = {"pasta": str(base), "existe": base.is_dir(), "ig": fila["config"]["drive_ig"],
                  "paginas": sum(1 for n in _pastas_paginas() if (base / n).is_dir()) if base.is_dir() else 0}
-        itens = [{**i, "avisos": [*i.get("avisos", []), *extra[i["id"]]]} if i["id"] in extra else i for i in fila["itens"]]
+        itens = [
+            {
+                **i,
+                "idioma": i.get("idioma") if i.get("idioma") in ("en", "es") else _idioma_video(i["nome"], i.get("origem", ""), i.get("destinos"), S=None),
+                "avisos": [*i.get("avisos", []), *extra.get(i["id"], [])],
+            }
+            for i in fila["itens"]
+        ]
         return {"contas": contas_publico(), "itens": itens, "config": fila["config"], "bloqueio": fila.get("bloqueio"),
-                "roleta": roleta_publica(), "avatares_fotos": list(_mapa_fotos_avatares()),
+                "roleta": roleta_publica(), "avatares_fotos": list(_mapa_fotos_avatares("en")),
+                "avatares_fotos_es": list(_mapa_fotos_avatares("es")),
+                "avatares_idiomas": _mapa_idiomas_avatares(),
                 "entrada": str(ENTRADA), "drive": drive, "log": fila["log"][-30:]}
 
 
-ACOES = {"conectar": conectar, "desconectar": desconectar, "remover-perfil": remover_perfil,
+ACOES = {"conectar": conectar, "desconectar": desconectar, "remover-perfil": remover_perfil, "idioma": definir_idioma,
          "configurar-massa": configurar_paginas_massa, "salvar": salvar, "agendar": agendar, "lote": lote,
          "destinos-lote": destinos_lote, "paginas-config": paginas_config, "agendar-sugeridos": agendar_sugeridos,
          "atualizar-paginas": atualizar_paginas, "avatares": avatares,

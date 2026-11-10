@@ -2,8 +2,7 @@ name: Kakashi Nuvem (Postagem + Radar 24h)
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
-    - cron: '7,22,37,52 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       forcar:
@@ -22,7 +21,7 @@ concurrency:
 jobs:
   postar-e-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 45
     env:
       TZ: America/Sao_Paulo
       POSTAGEM_DIR: ${{ github.workspace }}/output/postagem

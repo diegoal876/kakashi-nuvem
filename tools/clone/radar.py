@@ -52,7 +52,7 @@ CAPAS = postagem.DIR / "radar_capas"
 QUADROS = postagem.DIR / "radar_quadros"
 CAPA_MAX = 2 * 1024 * 1024
 LINK_S = 1800               # how long a link to a video from Meta is reused
-HORARIOS_PADRAO = ["09:00", "13:00", "17:00", "20:30"]  # the last one ends before the 21h summary
+HORARIOS_PADRAO = ["03:30", "06:30", "09:00", "13:00", "17:00", "20:30"]  # includes early-morning cloud reads for 00h/03h/06h waves
 MAX_POSTS = 20              # videos that make the account's median
 GUARDAR = 200               # videos kept per account: the ranking looks further back than the median
 MADURO_H = 24               # a younger video is not compared with the others yet
@@ -149,6 +149,8 @@ for _campo, _valor in (("fase2_views", FASE2_VIEWS), ("fase2_vezes", FASE2_VEZES
                        ("queda_videos", QUEDA_VIDEOS), ("queda_pct", QUEDA_PCT)):
     estado["config"].setdefault(_campo, _valor)
 estado["config"].setdefault("horarios_coleta", list(HORARIOS_PADRAO))
+if estado["config"].get("horarios_coleta") == ["09:00", "13:00", "17:00", "20:30"]:
+    estado["config"]["horarios_coleta"] = list(HORARIOS_PADRAO)
 estado["config"].setdefault("piso_cedo", 1000)
 estado["config"].setdefault("resumo_hora", 21)  # None turns the daily summary off
 estado["config"].setdefault("restricoes", {})  # Roleta Page -> when the user said its drop came from a restriction
@@ -169,6 +171,7 @@ estado.setdefault("avatares_fracos_ignorados", [])  # the user chose to keep the
 estado.setdefault("prioridade_dia", datetime.now().date().isoformat())  # today's Roleta keeps the order it started with
 estado.setdefault("relatorio_dia", datetime.now().date().isoformat())  # the first one waits for the next morning
 estado["config"].setdefault("tipos_avatar", {})  # avatar number -> {idade, cabelo, origem: claude|manual}
+estado["config"].setdefault("avatares_trocados", {})  # avatar number -> unix ts when its face was replaced keeping the number
 estado["config"].setdefault("criativos", {})  # "copy 25" -> {nome, ingrediente, local, origem: claude|manual}
 for _chave, _nome in estado["config"].pop("nomes_formato", {}).items():  # names given before creatives existed
     estado["config"]["criativos"][_chave] = {"nome": _nome, "origem": "manual"}
@@ -238,16 +241,28 @@ def _numero(v) -> int | None:
 
 
 def retencao(grafico, duracao) -> dict:
-    """Share of viewers left after RETEM_S seconds and at the end. Meta's graph has one point per slice of the video,
-    from start to end, and the number of slices changes with its length."""
+    """Share of viewers left after RETEM_S seconds and at the end, plus the exact second of the steepest viewer drop-off
+    (queda_s and queda_pct) after the 3s Reel view threshold."""
     if not isinstance(grafico, dict) or not grafico:
         return {}
     pontos = {int(k): v for k, v in grafico.items() if isinstance(v, (int, float))}
     if not pontos:
         return {}
-    r = {"fim": round(pontos[max(pontos)] * 100, 1)}
-    if duracao and duracao > RETEM_S:
-        r["retem6"] = round(pontos[min(pontos, key=lambda k: abs(k - RETEM_S / duracao * max(pontos)))] * 100, 1)
+    max_k = max(pontos)
+    r = {"fim": round(pontos[max_k] * 100, 1)}
+    if duracao and duracao > RETEM_S and max_k > 0:
+        r["retem6"] = round(pontos[min(pontos, key=lambda k: abs(k - RETEM_S / duracao * max_k))] * 100, 1)
+    ks = sorted(pontos)
+    melhor_queda, melhor_k = 0.0, None
+    for k1, k2 in zip(ks, ks[1:]):
+        if k2 < 4:
+            continue
+        q = (pontos[k1] - pontos[k2]) * 100
+        if q > melhor_queda:
+            melhor_queda, melhor_k = q, k1
+    if melhor_k is not None and melhor_queda >= 1.5 and max_k > 0:
+        r["queda_s"] = round((melhor_k / max_k * duracao) if duracao else float(melhor_k), 1)
+        r["queda_pct"] = round(melhor_queda, 1)
     return r
 
 
@@ -270,7 +285,7 @@ def metricas_fb(j: dict, duracao=None) -> dict:
 
 def lista_fb(p: dict) -> list[dict]:
     r = graph("GET", f"{p['id']}/video_reels", p["token"], limit=MAX_POSTS,
-              fields="id,created_time,permalink_url,description,picture,length,comments.summary(true).limit(0)")
+              fields="id,created_time,permalink_url,description,picture,length,comments.filter(toplevel).summary(true).limit(0)")
     out = []
     for v in r.get("data", []):
         link = v.get("permalink_url") or f"/reel/{v['id']}/"
@@ -295,6 +310,28 @@ def _formato(item: dict) -> str | None:
     if item.get("origem") == "tela_dividida" or arquivo.startswith("saida_tela_dividida"):
         return "Tela dividida"
     return nome.split(" · ")[0] if " · " in nome else None
+
+
+def registrar_item(item: dict, dest: str, vid: str) -> None:
+    """Immediately records avatar and copy/format into radar.json at upload time so queue cleanup never loses it."""
+    if not vid or not dest.startswith("fb:"):
+        return
+    key = f"fb:{vid}"
+    av = postagem._avatar(item.get("nome", ""), solto=True)
+    fmt = _formato(item)
+    with lock:
+        reg = estado["registro"].setdefault(key, {"avatar": None, "formato": None})
+        mudou = False
+        if av and not reg.get("avatar"):
+            reg["avatar"] = av
+            mudou = True
+        if fmt and not reg.get("formato"):
+            reg["formato"] = fmt
+            mudou = True
+        if key in estado["posts"]:
+            estado["posts"][key].update({k: v for k, v in reg.items() if v})
+        if mudou:
+            _salvar()
 
 
 def registrar() -> int:
@@ -324,12 +361,14 @@ def _guardar(p: dict, v: dict, nums: dict, agora: int) -> None:
     key = f"fb:{v['id']}"
     with lock:
         atual = estado["posts"].setdefault(key, {"avisado": 0, "hist": []})
-        atual.update({"dest": f"fb:{p['id']}", "pagina": p["nome"], "id": v["id"], "criado": v["criado"], "titulo": v["titulo"], "link": v["link"]})
+        atual.update({"dest": f"fb:{p['id']}", "pagina": p["nome"], "id": v["id"], "criado": v["criado"], "titulo": v["titulo"],
+                      "link": v["link"], **({"duracao": v["duracao"]} if v.get("duracao") else {})})
         atual.update(estado["registro"].get(key) or {})
         atual.update({k: n for k, n in {"comments": v.get("comments"), **nums}.items() if n is not None})
         atual["lido"] = agora
         if nums.get("views") is not None:
-            atual["hist"] = (atual["hist"] + [[agora, nums["views"]]])[-20:]
+            c_val = atual.get("comments") or 0
+            atual["hist"] = (atual["hist"] + [[agora, nums["views"], c_val]])[-24:]
 
 
 def _podar() -> None:
@@ -477,22 +516,59 @@ def _maduros(lista: list, agora: int) -> list:
     return sorted((p for p in lista if agora - p["criado"] >= MADURO_H * 3600), key=lambda p: p["criado"], reverse=True)
 
 
+def _mediana_robusta(maduros: list[dict]) -> float | None:
+    """Trimmed/Winsorized median: if a Page had stalled deliveries (< 50 views) mixed with normal videos (>= 100 views),
+    compute the baseline without the stalled zeroes so one 10k video does not become 450x."""
+    if not maduros:
+        return None
+    views = [p["views"] for p in maduros if p.get("views") is not None]
+    if not views:
+        return None
+    ativos = [v for v in views if v >= 50]
+    if len(ativos) >= max(4, len(views) // 3):
+        return max(float(median(ativos)), 80.0)
+    return float(median(views))
+
+
+def _faixa_horario(ts: int) -> str:
+    h = datetime.fromtimestamp(ts).hour
+    if h < 3:
+        return "00h–02h (Madrugada 1)"
+    if h < 6:
+        return "03h–05h (Madrugada 2)"
+    if h < 12:
+        return "06h–11h (Manhã)"
+    if h < 18:
+        return "12h–17h (Tarde)"
+    return "18h–23h (Noite)"
+
+
+def _idiomas_dest() -> dict[str, str]:
+    out = {f"fb:{c['id']}": postagem._idioma(c.get("idioma")) for c in postagem.contas().get("paginas", [])}
+    S = postagem.roleta_dados() or {}
+    if S:
+        for rid, cid in roleta.casar_paginas(S, postagem.contas().get("paginas", [])).items():
+            out[f"fb:{cid}"] = roleta.idioma_de(S.get("paginas", {}).get(rid))
+    return out
+
+
 def analisar(posts: dict, cfg: dict, agora: int) -> tuple[list[dict], list[dict]]:
-    """(one line per scored video, one line per account). A video gets a band only when the account has min_posts
-    mature videos and it passed the views floor: below that the median says nothing. Older videos are scored against
-    the same median, for the ranking; "recente" marks the ones that made it."""
+    """(one line per scored video, one line per account). Uses robust baseline median, 30-day phase window
+    (janela_fases), replay rate (replay_x), and copy-adjusted score (score_copy)."""
     linhas, contas = [], []
+    idiomas_d = _idiomas_dest()
     for dest, lista in _grupos(posts).items():
+        lang_d = idiomas_d.get(dest, "en")
         todos = _maduros(lista, agora)
         maduros = todos[:MAX_POSTS]
-        base = median(p["views"] for p in maduros) if maduros else None
+        base = _mediana_robusta(maduros)
         taxas = [e for p in maduros if (e := _eng(p)) is not None]
         comp = [p["shares"] / p["views"] for p in maduros if p.get("shares") is not None and p["views"]]
         base_eng, base_comp = median(taxas) if taxas else None, median(comp) if comp else None
-        contas.append({"dest": dest, "pagina": lista[0]["pagina"], "amostra": len(maduros),
+        contas.append({"dest": dest, "pagina": lista[0]["pagina"], "idioma": lang_d, "amostra": len(maduros),
                        "mediana": base, "pronta": len(maduros) >= cfg["min_posts"]})
         for n, p in enumerate(todos):
-            score = round(p["views"] / max(base, 1), 1)
+            score = round(p["views"] / max(base or 1, 1), 1)
             faixa, motivo = None, ""
             if len(maduros) < cfg["min_posts"]:
                 motivo = "poucos dados"
@@ -500,17 +576,41 @@ def analisar(posts: dict, cfg: dict, agora: int) -> tuple[list[dict], list[dict]
                 motivo = "abaixo do piso"
             else:
                 faixa = next((nome for nome, limite in FAIXAS if score >= limite), None)
-            linhas.append({"key": p["key"], "dest": dest, "pagina": p["pagina"], "link": p["link"],
+            views_v = p["views"] or 0
+            plays_t = p.get("plays_total") or 0
+            replay_x = round(plays_t / views_v, 2) if plays_t and views_v and plays_t >= views_v else None
+            comm_v = p.get("comments") or 0
+            taxa_comm = round(1000 * comm_v / views_v, 1) if views_v >= 100 else 0.0
+            idade_v = _do_avatar(cfg, p, "idade")
+            papel_v = _do_criativo(cfg, p, "papel")
+            sinergia = f"{papel_v} + {idade_v}" if papel_v and idade_v and "outro" not in (papel_v, idade_v) else None
+            linhas.append({"key": p["key"], "dest": dest, "pagina": p["pagina"], "idioma": lang_d, "link": p["link"],
                            "titulo": p.get("titulo", ""), "avatar": p.get("avatar"), "formato": p.get("formato"),
                            "criativo": _nome_formato(cfg, p.get("formato")), "gancho": _do_criativo(cfg, p, "gancho"),
-                           "papel": _do_criativo(cfg, p, "papel"), "idade": _do_avatar(cfg, p, "idade"),
-                           "cabelo": _do_avatar(cfg, p, "cabelo"), "retem6": p.get("retem6"), "fim": p.get("fim"),
-                           "assistido_s": p.get("assistido_s"), "criado": p["criado"], "recente": n < MAX_POSTS, "capa": p.get("capa"),
-                           "views": p["views"], "plays_total": p.get("plays_total"), "mediana": base, "score": score, "faixa": faixa, "motivo": motivo,
-                           "shares": p.get("shares"), "comments": p.get("comments"),
+                           "papel": papel_v, "idade": idade_v,
+                           "cabelo": _do_avatar(cfg, p, "cabelo"), "sinergia": sinergia,
+                           "faixa_horario": _faixa_horario(p["criado"]) if p.get("criado") else None,
+                           "retem6": p.get("retem6"), "fim": p.get("fim"), "queda_s": p.get("queda_s"), "queda_pct": p.get("queda_pct"),
+                           "assistido_s": p.get("assistido_s"), "criado": p["criado"],
+                           "recente": n < MAX_POSTS,
+                           "janela_fases": (agora - p["criado"]) <= 30 * 86400 or n < MAX_POSTS * 2,
+                           "capa": p.get("capa"),
+                           "views": views_v, "plays_total": p.get("plays_total"), "replay_x": replay_x,
+                           "mediana": base, "score": score, "score_copy": score, "faixa": faixa, "motivo": motivo,
+                           "shares": p.get("shares"), "comments": p.get("comments"), "taxa_comm": taxa_comm,
+                           "ganho_comments_24h": _ganho_comentarios_24h(p, agora),
                            "qualidade": _vezes(_eng(p), base_eng),
                            "shares_x": _vezes(p["shares"] / p["views"], base_comp)
                            if p.get("shares") is not None and p["views"] else None})
+    # Compute copy-adjusted score (score_copy): how well this video did compared to other videos of the SAME copy
+    scores_por_copy: dict[tuple[str, str], list[float]] = {}
+    for a in linhas:
+        if a.get("formato") and a["motivo"] != "poucos dados":
+            scores_por_copy.setdefault((a.get("idioma", "en"), a["formato"]), []).append(a["score"])
+    med_copy = {k: max(median(vals), 0.35) for k, vals in scores_por_copy.items() if len(vals) >= 3}
+    for a in linhas:
+        mc = med_copy.get((a.get("idioma", "en"), a.get("formato") or ""))
+        a["score_copy"] = round(a["score"] / mc, 2) if mc else a["score"]
     linhas.sort(key=lambda x: x["score"], reverse=True)
     contas.sort(key=lambda c: (not c["pronta"], c["pagina"]))
     return linhas, contas
@@ -521,23 +621,64 @@ def _mediana(valores) -> float | None:
     return round(median(lista), 1) if lista else None
 
 
+def _avatar_valido(a: dict, cfg: dict | None = None) -> bool:
+    """True when the video has an avatar number and was posted after that number's latest face replacement."""
+    trocados = (cfg or estado["config"]).get("avatares_trocados") or {}
+    return bool(a.get("avatar")) and a.get("criado", 0) >= trocados.get(str(a["avatar"]), 0)
+
+
+def _diagnostico_grupo(score_med: float, retem6: float | None, fim: float | None, comm_por_vid: float, taxa_out: int) -> str:
+    """Automatic bottleneck diagnosis combining reach, 6s hook retention, completion rate, and comment conversion."""
+    if comm_por_vid >= 12 and (score_med >= 1.2 or taxa_out >= 10):
+        return "🔥 Alta conversão"
+    if retem6 is not None and retem6 >= 48 and fim is not None and fim < 16:
+        return "🧲 Gancho forte, meio cai"
+    if (score_med >= 1.8 or taxa_out >= 15) and comm_por_vid < 2.5:
+        return "👀 Alcance alto, CTA fraco"
+    if retem6 is not None and retem6 < 33 and score_med < 0.9:
+        return "⚠️ Abertura fraca (<6s)"
+    return ""
+
+
 def ranking(linhas: list[dict], campo: str) -> list[dict]:
-    """Avatars or formats by how often they beat the account's normal. Videos of an account with too few videos have
-    no real score, so they do not count; score is the median one, so one lucky video does not carry a name."""
+    """Avatars, creatives, hooks, roles, synergies, or posting hours ranked with Bayesian shrinkage (score_bayes),
+    copy-adjusted score (score_copy), replay rate, and comment conversion metrics."""
     grupos: dict[str, list] = {}
     for a in linhas:
-        if a.get(campo) and a["motivo"] != "poucos dados":
-            grupos.setdefault(a[campo], []).append(a)
+        val = a.get(campo)
+        if not val or a["motivo"] == "poucos dados":
+            continue
+        if campo == "avatar" and not _avatar_valido(a):
+            continue
+        if campo == "criativo" and SO_COPIA_RE.match(str(val)):
+            continue  # Unidentified raw copy numbers wait for analysis instead of polluting creative rankings
+        grupos.setdefault(val, []).append(a)
     out = []
     for chave, lista in grupos.items():
+        n_vids = len(lista)
         outliers = sum(1 for a in lista if a["faixa"] in AVISO)
+        taxa = round(100 * outliers / n_vids)
         melhores = sorted(lista, key=lambda a: a["score"], reverse=True)[:EXEMPLOS]
-        out.append({"chave": chave, "videos": len(lista), "outliers": outliers, "taxa": round(100 * outliers / len(lista)),
+        score_med = round(median(a["score"] for a in lista), 1)
+        score_copy_med = round(median(a.get("score_copy", a["score"]) for a in lista), 2)
+        # Bayesian shrinkage: pull small samples (1-3 videos) toward neutral prior (1.0x) with weight k=4
+        score_bayes = round((n_vids * score_med + 4 * 1.0) / (n_vids + 4), 2)
+        retem6 = _mediana(a.get("retem6") for a in lista)
+        fim = _mediana(a.get("fim") for a in lista)
+        queda_s = _mediana(a.get("queda_s") for a in lista)
+        queda_pct = _mediana(a.get("queda_pct") for a in lista)
+        replay_x = _mediana(a.get("replay_x") for a in lista)
+        total_comm = sum(a.get("comments") or 0 for a in lista)
+        comm_vid = round(total_comm / n_vids, 1)
+        diag = _diagnostico_grupo(score_med, retem6, fim, comm_vid, taxa) if n_vids >= 3 else ""
+        out.append({"chave": chave, "videos": n_vids, "outliers": outliers, "taxa": taxa,
                     "copies": sorted({a["formato"] for a in lista if a.get("formato")}),
-                    "retem6": _mediana(a.get("retem6") for a in lista), "fim": _mediana(a.get("fim") for a in lista),
-                    "score": round(median(a["score"] for a in lista), 1), "melhor": max(a["score"] for a in lista),
+                    "retem6": retem6, "fim": fim, "queda_s": queda_s, "queda_pct": queda_pct, "replay_x": replay_x,
+                    "score": score_med, "score_copy": score_copy_med, "score_bayes": score_bayes,
+                    "comentarios": total_comm, "comentarios_video": comm_vid, "diagnostico": diag,
+                    "melhor": max(a["score"] for a in lista),
                     "exemplos": [{k: a[k] for k in ("key", "capa", "score", "link", "pagina")} for a in melhores]})
-    return sorted(out, key=lambda r: (-r["outliers"], -r["taxa"], -r["score"]))
+    return sorted(out, key=lambda r: (-r["score_bayes"], -r["outliers"], -r["taxa"], -r["comentarios"]))
 
 
 def conselhos(linhas: list[dict]) -> list[dict]:
@@ -552,21 +693,22 @@ def conselhos(linhas: list[dict]) -> list[dict]:
         for r in itens:
             if r["videos"] < CONSELHO_VIDEOS:
                 r["acao"] = "poucos"
-            elif r["score"] >= CONTINUAR_SCORE or r["taxa"] >= CONTINUAR_TAXA:
+            elif r["score"] >= CONTINUAR_SCORE or r["taxa"] >= CONTINUAR_TAXA or (r["comentarios_video"] >= 15 and r["score"] >= 1.2):
                 r["acao"] = "continuar"
             else:
-                r["acao"] = "pausar" if r["score"] <= PAUSAR_SCORE else "manter"
+                r["acao"] = "pausar" if r["score"] <= PAUSAR_SCORE and r["comentarios_video"] < 5 else "manter"
         if itens:
             out.append({"dest": dest, "pagina": lista[0]["pagina"], "criativos": itens,
-                        "ganchos": ranking(lista, "gancho"), "avatares": ranking(lista, "avatar")[:5]})
+                        "ganchos": ranking(lista, "gancho"), "avatares": ranking(lista, "avatar")[:5],
+                        "horarios": ranking(lista, "faixa_horario")})
     return sorted(out, key=lambda c: c["pagina"].lower())
 
 
 def _views_na_idade(p: dict, horas: float) -> float | None:
     """A video's views when it was that old, between the two readings around that moment; the post itself counts as
-    a reading of zero. None when the readings are too far apart to say."""
+    a reading of zero. Supports both [t, v] and [t, v, c] hist points."""
     alvo = p["criado"] + horas * 3600
-    pontos = sorted([[p["criado"], 0]] + (p.get("hist") or []))
+    pontos = sorted([[p["criado"], 0]] + [[x[0], x[1]] for x in (p.get("hist") or []) if len(x) >= 2])
     antes = [x for x in pontos if x[0] <= alvo]
     depois = [x for x in pontos if x[0] >= alvo]
     if not antes or not depois or depois[0][0] - antes[-1][0] > CEDO_FOLGA_H * 3600:
@@ -576,29 +718,35 @@ def _views_na_idade(p: dict, horas: float) -> float | None:
 
 
 def subindo(posts: dict, cfg: dict, agora: int) -> list[dict]:
-    """Videos younger than MADURO_H already running ahead of the account. Compared with the older videos at the same
-    age once enough of them were read at that age; until then, with the account's plain median, which is harder to
-    beat that early, so it can only miss a video and not raise a false alarm."""
+    """Videos younger than MADURO_H already running ahead of the account. Uses age-interpolated readings when available,
+    or a realistic early-maturity curve (25%..100% of 24h median) so early breakouts at 2h-6h are detected accurately."""
     out = []
+    idiomas_d = _idiomas_dest()
     for dest, lista in _grupos(posts).items():
         maduros = _maduros(lista, agora)
         if len(maduros[:MAX_POSTS]) < cfg["min_posts"]:
             continue
-        final = median(p["views"] for p in maduros[:MAX_POSTS])
+        final = _mediana_robusta(maduros[:MAX_POSTS]) or 1.0
         for p in lista:
             horas = (agora - p["criado"]) / 3600
             if not CEDO_MIN_H <= horas < MADURO_H or p["views"] < cfg["piso_cedo"]:
                 continue
             na_idade = [v for q in maduros[:40] if (v := _views_na_idade(q, horas)) is not None]
             por_idade = len(na_idade) >= CEDO_AMOSTRA
-            base = median(na_idade) if por_idade else final
+            fator_curva = min(1.0, 0.25 + 0.75 * (horas / MADURO_H))
+            base = median(na_idade) if por_idade else max(final * fator_curva, 100.0)
             vezes = round(p["views"] / max(base, 1), 1)
-            if vezes >= CEDO_LIMITE:
-                out.append({"key": p["key"], "pagina": p["pagina"], "link": p["link"], "views": p["views"], "plays_total": p.get("plays_total"),
+            plays_t = p.get("plays_total") or 0
+            replay_x = round(plays_t / p["views"], 2) if plays_t and p["views"] and plays_t >= p["views"] else None
+            comm_v = p.get("comments") or 0
+            # Early viral signal: beats 3x age expectation, OR beats 2.2x with high replay (>=1.25x) or strong early comments (>=12)
+            if vezes >= CEDO_LIMITE or (vezes >= 2.2 and ((replay_x or 0) >= 1.25 or comm_v >= 12)):
+                out.append({"key": p["key"], "pagina": p["pagina"], "idioma": idiomas_d.get(dest, "en"), "link": p["link"], "views": p["views"],
+                            "plays_total": p.get("plays_total"), "replay_x": replay_x, "comments": comm_v,
                             "esperado": round(base), "vezes": vezes, "horas": int(horas), "por_idade": por_idade,
                             "avatar": p.get("avatar"), "formato": p.get("formato"), "criado": p["criado"],
                             "criativo": _nome_formato(cfg, p.get("formato"))})
-    return sorted(out, key=lambda x: x["vezes"], reverse=True)
+    return sorted(out, key=lambda x: (x["vezes"], x.get("comments") or 0), reverse=True)
 
 
 def restricoes_suspeitas(posts: dict, agora: int) -> list[dict]:
@@ -637,28 +785,34 @@ def copias_fracas(linhas: list[dict], cfg: dict) -> dict[str, dict]:
 
 def avatares_fracos(linhas: list[dict], cfg: dict) -> dict[str, dict]:
     """Avatars that had their chance: AVATAR_FRACO_VIDEOS scored videos on AVATAR_FRACO_PAGINAS Pages, not one good,
-    and a median at most AVATAR_FRACO_MEDIANA times the normal of the Page each video went out on. Each video is
-    compared with its own Page, so a small Page does not make its avatars look bad."""
+    both raw median and copy-adjusted median <= AVATAR_FRACO_MEDIANA, and low comment conversion (protects high-comment
+    avatars like Avatar 18 from being flagged just because they ran on weak test copies)."""
     bom = _bom(cfg)
     grupos: dict[str, list] = {}
     for a in linhas:
-        if a["motivo"] != "poucos dados" and a.get("avatar"):
+        if a["motivo"] != "poucos dados" and _avatar_valido(a, cfg):
             grupos.setdefault(a["avatar"], []).append(a)
     out = {}
     for n, v in grupos.items():
-        paginas, mediana = {a["dest"] for a in v}, median(a["score"] for a in v)
+        paginas = {a["dest"] for a in v}
+        mediana = median(a["score"] for a in v)
+        mediana_copy = median(a.get("score_copy", a["score"]) for a in v)
+        total_comm = sum(a.get("comments") or 0 for a in v)
+        # Protect avatars that generate real buyer comments (>= 50 total or >= 4 comments/video) or perform well relative to their copy
         if (len(v) >= AVATAR_FRACO_VIDEOS and len(paginas) >= AVATAR_FRACO_PAGINAS and not any(bom(a) for a in v)
-                and mediana <= AVATAR_FRACO_MEDIANA):
+                and mediana <= AVATAR_FRACO_MEDIANA and mediana_copy <= 0.75
+                and total_comm < max(50, len(v) * 4)):
             out[n] = {"videos": len(v), "paginas": len(paginas), "mediana": round(mediana, 2),
-                      "comentarios": sum(a.get("comments") or 0 for a in v)}
+                      "score_copy": round(mediana_copy, 2), "comentarios": total_comm}
     return dict(sorted(out.items(), key=lambda x: x[1]["mediana"]))
 
 
-def _fracos_na_roda(fracos: dict, S: dict | None) -> dict[str, dict]:
+def _fracos_na_roda(fracos: dict, S: dict | None, idioma: str = "en") -> dict[str, dict]:
     """The weak avatars still rotating on the Roleta and not kept by the user, with their Roleta id."""
     if not S:
         return {}
-    por_numero = {roleta.numero_avatar(S, a): a for a in S.get("avatares", {})}
+    lang = "es" if str(idioma or "").lower() == "es" else "en"
+    por_numero = {roleta.numero_avatar(S, a): a for a, obj in S.get("avatares", {}).items() if roleta.idioma_de(obj) == lang}
     oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if p.get("fase") == 3}
     return {n: {**f, "avid": por_numero[n]} for n, f in fracos.items()
             if n in por_numero and n not in estado["avatares_fracos_ignorados"]
@@ -670,8 +824,19 @@ def _ganho_24h(p: dict, agora: int) -> int | None:
     (18 hours or more), or its total would pass as a day's growth."""
     if agora - p["criado"] <= 86400:
         return p["views"]
-    antigas = [v for t, v in (p.get("hist") or []) if t <= agora - 18 * 3600]
+    antigas = [x[1] for x in (p.get("hist") or []) if len(x) >= 2 and x[0] <= agora - 18 * 3600]
     return p["views"] - antigas[-1] if antigas else None
+
+
+def _ganho_comentarios_24h(p: dict, agora: int) -> int | None:
+    """Comments gained in the last 24 hours (when 3-tuple hist is available or video is <24h old)."""
+    c_atual = p.get("comments")
+    if c_atual is None:
+        return None
+    if agora - p["criado"] <= 86400:
+        return c_atual
+    antigas = [x[2] for x in (p.get("hist") or []) if len(x) >= 3 and x[0] <= agora - 18 * 3600]
+    return max(0, c_atual - antigas[-1]) if antigas else None
 
 
 def virais_24h(coleta: int) -> list[dict]:
@@ -692,6 +857,8 @@ def virais_24h(coleta: int) -> list[dict]:
 
 
 def _do_avatar(cfg: dict, p: dict, campo: str) -> str | None:
+    if p.get("criado", 0) < (cfg.get("avatares_trocados") or {}).get(str(p.get("avatar")), 0):
+        return None
     return ((cfg.get("tipos_avatar") or {}).get(str(p.get("avatar"))) or {}).get(campo)
 
 
@@ -738,44 +905,70 @@ def _queda(pg: str, p: dict, lista: list[dict], numero: str | None, bom, cfg: di
 
 
 def _bom(cfg: dict):
-    """A good video: Phase 2's views and times its Page's normal, and the comments that bring the money ("yes" in the
-    comments gets the link by DM): views with no comments are reach that sells nothing."""
+    """A good video: passes standard Phase 2 thresholds (views, score, comments), OR achieves high absolute buyer-comment
+    conversion on an already-strong Page where a high baseline median compresses the multiplier."""
     v, x, c = cfg.get("fase2_views", FASE2_VIEWS), cfg.get("fase2_vezes", FASE2_VEZES), cfg.get("fase2_comentarios", FASE2_COMENTARIOS)
-    return lambda a: a["views"] >= v and a["score"] >= x and (a.get("comments") or 0) >= c
+    return lambda a: (
+        (a["views"] >= v and a["score"] >= x and (a.get("comments") or 0) >= c)
+        or (a["views"] >= v * 2 and a["score"] >= max(1.8, x * 0.6) and (a.get("comments") or 0) >= int(c * 1.5))
+        or (a["views"] >= v and a["score"] >= 1.5 and (a.get("comments") or 0) >= int(c * 2.5))
+    )
 
 
 def _forte(cfg: dict):
     v, x, c = cfg.get("fase3_views", FASE3_VIEWS), cfg.get("fase3_vezes", FASE3_VEZES), cfg.get("fase3_comentarios", FASE3_COMENTARIOS)
-    return lambda a: a["views"] >= v and a["score"] >= x and (a.get("comments") or 0) >= c
+    return lambda a: (
+        (a["views"] >= v and a["score"] >= x and (a.get("comments") or 0) >= c)
+        or (a["views"] >= v * 1.5 and a["score"] >= max(5.0, x * 0.5) and (a.get("comments") or 0) >= int(c * 1.3))
+    )
+
+
+def _tendencia_criativo(v: list[dict], bom) -> str:
+    """Detect creative fatigue or acceleration by comparing the newer half (or last 7 days) against older videos."""
+    if len(v) < 12:
+        return "estavel"
+    ordenados = sorted(v, key=lambda a: a["criado"])
+    meio = len(ordenados) // 2
+    antigos, recentes = ordenados[:meio], ordenados[meio:]
+    taxa_ant = sum(1 for a in antigos if bom(a)) / len(antigos)
+    taxa_rec = sum(1 for a in recentes if bom(a)) / len(recentes)
+    med_ant = median(a["score"] for a in antigos)
+    med_rec = median(a["score"] for a in recentes)
+    if (taxa_rec >= taxa_ant * 1.35 and taxa_rec >= 0.04) or med_rec >= med_ant * 1.35:
+        return "subindo"
+    if (taxa_ant >= 0.05 and taxa_rec < taxa_ant * 0.45) or (med_ant >= 1.0 and med_rec <= med_ant * 0.6):
+        return "caindo"
+    return "estavel"
 
 
 def criativos_globais(linhas: list[dict], cfg: dict) -> dict[str, dict]:
-    """Each creative judged on every Page together, since they all post the same ones: one hit on one Page can be
-    luck, the same creative good on several Pages is not. vencedor: enough videos, good ones on VENCEDOR_PAGINAS
-    Pages and a hit rate of VENCEDOR_TAXA%; arriscado: it was the main creative of too many of the Pages Meta
-    restricted, for the Pages it ran on; fraco: enough videos and none good; em teste: the rest."""
+    """Each creative judged across all Pages over the 30-day window (janela_fases), including creative fatigue trend
+    (tendencia) and high-conversion recognition."""
     bom = _bom(cfg)
     restritas = Counter(r["criativo"] for r in estado["restricoes_criativo"].values() if r.get("criativo"))
     grupos: dict[str, list] = {}
     for a in linhas:
-        if a["recente"] and a["motivo"] != "poucos dados" and a.get("criativo") and a["criativo"] not in SEM_CRIATIVO:
+        if a.get("janela_fases", a["recente"]) and a["motivo"] != "poucos dados" and a.get("criativo") and a["criativo"] not in SEM_CRIATIVO:
             grupos.setdefault(a["criativo"], []).append(a)
     out = {}
     for c, v in grupos.items():
         paginas, com_bom = {a["dest"] for a in v}, {a["dest"] for a in v if bom(a)}
         n_bons = sum(1 for a in v if bom(a))
+        total_comm = sum(a.get("comments") or 0 for a in v)
         taxa, r = round(100 * n_bons / len(v), 1), restritas.get(c, 0)
-        if r >= ARRISCADO_RESTRICOES and 100 * r >= ARRISCADO_PCT * len(paginas):
+        tendencia = _tendencia_criativo(v, bom)
+        if r >= 3 and 100 * r >= 30 * len(paginas):
             status = "arriscado"
-        elif len(v) >= VENCEDOR_VIDEOS and len(com_bom) >= VENCEDOR_PAGINAS and taxa >= VENCEDOR_TAXA:
+        elif len(v) >= VENCEDOR_VIDEOS and len(com_bom) >= VENCEDOR_PAGINAS and (taxa >= VENCEDOR_TAXA or (n_bons >= 3 and total_comm >= 1000)):
             status = "vencedor"
-        elif len(v) >= VENCEDOR_VIDEOS and not n_bons:
+        elif len(v) >= VENCEDOR_VIDEOS and not n_bons and total_comm < len(v) * 8:
             status = "fraco"
         else:
             status = "em teste"
         out[c] = {"videos": len(v), "paginas": len(paginas), "bons": n_bons, "paginas_bons": len(com_bom), "taxa": taxa,
-                  "restricoes": r, "status": status, "comentarios": sum(a.get("comments") or 0 for a in v)}
-    return dict(sorted(out.items(), key=lambda x: (-x[1]["bons"], -x[1]["videos"])))
+                  "restricoes": r, "status": status, "tendencia": tendencia,
+                  "comentarios": total_comm, "retem6": _mediana(a.get("retem6") for a in v)}
+    return dict(sorted(out.items(), key=lambda x: (-x[1]["bons"], -x[1]["comentarios"], -x[1]["videos"])))
 
 
 def _por_que_nao(g: dict | None) -> str:
@@ -791,14 +984,8 @@ def _por_que_nao(g: dict | None) -> str:
 
 def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[dict], ignoradas: list, agora=None,
               esperam: dict | None = None) -> tuple[list[dict], list[dict]]:
-    """The user's phases, for the Pages of the Roleta, as (ready to confirm, in observation: what is missing).
-    Phase 2 keeps a creative: it has to have won on the Pages together (criativos_globais), have a good video here and
-    hold up here, its latest fase2_amostra videos at least fase2_mediana times the Page's normal, so a lucky hit does
-    not fix it. Phase 3 keeps an avatar: a strong video old enough to trust, and the avatar good on another Page too
-    (or fase3_bons_pagina times here), or it was the video and not the face. A control Page stays in Phase 1 to compare
-    with, and a Page that is paused or looks restricted waits (esperam). A video that passed with no avatar or copy on
-    record cannot fill the Roleta, so it only points the user to it. A Page that went back a phase climbs again only on
-    videos posted after that, or the same old hit would send it straight up."""
+    """Phase 2 and Phase 3 suggestions using the 30-day window (janela_fases) so weekly test waves do not erase
+    prior good videos, and excluding SEM_CRIATIVO ('Tela dividida', 'Clickbait') from missing-avatar warnings."""
     if not S:
         return [], []
     agora, esperam = agora or int(time.time()), esperam or {}
@@ -806,22 +993,32 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
     bons_aqui = cfg.get("fase3_bons_pagina", FASE3_BONS_PAGINA)
     bom, forte = _bom(cfg), _forte(cfg)
     antigo = lambda a: agora - a["criado"] >= FASE3_ESPERA_H * 3600
-    globais = criativos_globais(linhas, cfg)
+    globais_por_lang = {
+        lang: criativos_globais([a for a in linhas if a.get("idioma", "en") == lang], cfg)
+        for lang in ("en", "es")
+    }
     por_fb = {fb: pg for pg, fb in roleta.casar_paginas(S, conectadas).items()}
     oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if p.get("fase") == 3}
-    por_numero = {n: a for a in S.get("avatares", {}) if (n := roleta.numero_avatar(S, a))}
-    avatar_em: dict[str, set] = {}  # avatar number -> the Pages where it has a good video
+    por_numero = {
+        (roleta.idioma_de(S["avatares"][a]), n): a
+        for a in S.get("avatares", {})
+        if (n := roleta.numero_avatar(S, a))
+    }
+    avatar_em: dict[tuple[str, str], set] = {}  # (lang, avatar number) -> Pages where it has a good video
     por_pagina: dict[str, list] = {}
     for a in linhas:
-        if a["recente"] and a["motivo"] != "poucos dados" and a.get("avatar") and bom(a):
-            avatar_em.setdefault(a["avatar"], set()).add(a["dest"])
+        em_janela = a.get("janela_fases", a["recente"])
+        if em_janela and a["motivo"] != "poucos dados" and _avatar_valido(a, cfg) and bom(a):
+            avatar_em.setdefault((a.get("idioma", "en"), a["avatar"]), set()).add(a["dest"])
         pg = por_fb.get(a["dest"][3:])
-        if pg and a["recente"] and a["motivo"] != "poucos dados":
+        if pg and em_janela and a["motivo"] != "poucos dados":
             por_pagina.setdefault(pg, []).append(a)
     out, observa = [], []
     for pg, lista in por_pagina.items():
         p = S["paginas"].get(pg) or {}
-        base = {"pg": pg, "pagina": p.get("nome", pg)}
+        lang_pg = roleta.idioma_de(p)
+        globais = globais_por_lang.get(lang_pg, {})
+        base = {"pg": pg, "pagina": p.get("nome", pg), "idioma": lang_pg}
         if volta := _queda(pg, p, lista, roleta.numero_avatar(S, p.get("avatarOficial")), bom, cfg):
             out.append({**base, **volta})
         if p.get("fase") == 3:
@@ -830,8 +1027,9 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
         lista = [a for a in lista if a["criado"] >= p.get("voltouEm", 0)]
         bons = [a for a in lista if bom(a)]
         achou = False
-        for numero, deles in _agrupar(bons, "avatar").items():
-            avid, fortes = por_numero.get(numero), [a for a in deles if forte(a)]
+        for numero, deles in _agrupar([a for a in bons if _avatar_valido(a, cfg)], "avatar").items():
+            avid = por_numero.get((lang_pg, numero)) or por_numero.get(("en", numero))
+            fortes = [a for a in deles if forte(a)]
             if not avid or avid in oficiais or not fortes:
                 continue
             item = {**base, **_resumo_videos(fortes), "videos": len(deles), "id": f"{pg}|viral|{avid}", "tipo": "viral", "avatar": numero,
@@ -840,7 +1038,7 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
             if not any(antigo(a) for a in fortes):
                 horas = ceil((FASE3_ESPERA_H * 3600 - agora + min(a["criado"] for a in fortes)) / 3600)
                 falta.append(f"aguardando completar {FASE3_ESPERA_H}h no ar (cerca de {horas}h)")
-            if not (avatar_em.get(numero, set()) - {lista[0]["dest"]}) and len(deles) < bons_aqui:
+            if not (avatar_em.get((lang_pg, numero), set()) - {lista[0]["dest"]}) and len(deles) < bons_aqui:
                 falta.append(f"falta um vídeo bom deste avatar em outra Página (ou {_faltam(bons_aqui - len(deles))} aqui)")
             if trava:
                 falta.append(trava)
@@ -851,7 +1049,7 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
                 achou = True
         if p.get("fase", 1) == 1:
             for chave, deles in _agrupar(bons, "criativo").items():
-                if chave in SEM_CRIATIVO:
+                if chave in SEM_CRIATIVO or SO_COPIA_RE.match(str(chave)):
                     continue
                 ultimos = sorted((a for a in lista if a.get("criativo") == chave), key=lambda a: -a["criado"])[:amostra]
                 item = {**base, **_resumo_videos(deles), "id": f"{pg}|formato|{chave}", "tipo": "formato", "formato": chave,
@@ -870,9 +1068,9 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
                 else:
                     out.append(item)
                     achou = True
-        f3 = [a for a in lista if forte(a) and antigo(a)]
+        f3 = [a for a in lista if forte(a) and antigo(a) and a.get("formato") not in SEM_CRIATIVO]
         sem_dados = [a for a in f3 if not a.get("avatar")] or (
-            [a for a in bons if not a.get("criativo")] if p.get("fase", 1) == 1 else [])
+            [a for a in bons if not a.get("criativo") and a.get("formato") not in SEM_CRIATIVO] if p.get("fase", 1) == 1 else [])
         if sem_dados and not achou and not trava:
             m = max(sem_dados, key=lambda a: a["score"])
             out.append({**base, **_resumo_videos([m]), "id": f"{pg}|revisar|{m['key']}", "tipo": "revisar",
@@ -916,16 +1114,23 @@ def comparar_controle(linhas: list[dict], S: dict | None, conectadas: list[dict]
 
 
 def _registrar_restricoes(S: dict | None) -> None:
-    """When a Page is paused for a restriction, the creative most of its last videos had counts against that creative
-    (criativos_globais). Kept after the Page comes back: it happened."""
+    """When a Page is truly paused for a Meta restriction (code 368 / 'restri'), record its main creative.
+    Never count scheduler holds ('segurando', 'published') or Pages that have been reactivated."""
     if not S:
         return
     casadas, mudou = roleta.casar_paginas(S, postagem.contas().get("paginas", [])), False
+    # Clean up any Page that is no longer paused or was paused due to Meta's native scheduler hold
+    for rid in list(estado["restricoes_criativo"].keys()):
+        p = S.get("paginas", {}).get(rid) or {}
+        motivo = ((p.get("historico") or [{}])[-1].get("texto") or "").lower()
+        if not p.get("pausada") or "segurando" in motivo or "published" in motivo or "confirmar" in motivo:
+            estado["restricoes_criativo"].pop(rid, None)
+            mudou = True
     for rid, p in S.get("paginas", {}).items():
         if not p.get("pausada") or rid in estado["restricoes_criativo"] or rid not in casadas:
             continue
         motivo = ((p.get("historico") or [{}])[-1].get("texto") or "").lower()
-        if "restri" not in motivo and "meta" not in motivo:  # paused for another reason (a Page to check, not one Meta limited)
+        if ("restri" not in motivo and "368" not in motivo) or "segurando" in motivo:
             continue
         dest = f"fb:{casadas[rid]}"
         ultimos = sorted((q for q in estado["posts"].values() if q["dest"] == dest), key=lambda q: -q["criado"])[:10]
@@ -975,6 +1180,7 @@ def _quadros(url: str, destino: Path) -> bool:
 
 def transcrever(url: str, modelo) -> str:
     """What is said in the video, on this PC. Only adds to the analysis: without it the frames still go."""
+    QUADROS.mkdir(parents=True, exist_ok=True)
     audio = QUADROS / "audio.wav"
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", url, "-vn", "-ac", "1", "-ar", "16000",
                         "-t", str(WHISPER_S), str(audio)], capture_output=True, timeout=180, creationflags=postagem.NO_WINDOW)
@@ -1040,21 +1246,70 @@ def _perguntar_claude(texto: str, pasta: Path) -> dict:
     return json.loads(r.stdout or "{}")
 
 
-def _video_local(key: str) -> str | None:
-    """The queue's own copy of a posted video, for when Meta gives no link to it."""
+def _video_local(key: str, copia: str | None = None) -> str | None:
+    """Finds a local or Google Drive MP4 for a posted video (by video_id in queue, or by copy number in videos/Drive)."""
     vid = key.partition(":")[2]
     with postagem.lock:
         for i in postagem.fila["itens"]:
             if any(r.get("id") == vid for r in i["resultados"].values()):
                 f = postagem.VIDEOS / i["arquivo"]
-                return str(f) if f.is_file() else None
+                if f.is_file():
+                    return str(f)
+    if copia and (m := re.search(r"\d+", copia)):
+        cnum = int(m.group(0))
+        pastas = [postagem.VIDEOS]
+        drive_p = Path(postagem.fila.get("config", {}).get("pasta_drive") or r"G:\Meu Drive\Non Shop\001\Postagens")
+        if drive_p.is_dir():
+            pastas.extend([drive_p / "_Rodízio", drive_p / "_Rodízio ES", drive_p, drive_p.parent / "_kakashi_nuvem" / "videos"])
+        for pasta in pastas:
+            if not pasta.is_dir():
+                continue
+            for padrao in (f"*copy{cnum}.mp4", f"*copy {cnum}.mp4", f"*copy_{cnum}.mp4"):
+                achados = list(pasta.glob(padrao))
+                if achados:
+                    return str(achados[0])
     return None
 
 
+def _classificar_por_fala(copia: str, fala: str, existentes: list[str]) -> dict | None:
+    """Fast local semantic fallback when Claude Code CLI is unavailable or fails: classifies copy from Whisper transcript."""
+    if not fala or len(fala.strip()) < 10:
+        return None
+    t = fala.lower()
+    frase = re.split(r"(?<=[.!?])\s+", fala.strip())[0][:160]
+    ing = "Baking soda" if "baking soda" in t or "bicarbonate" in t else "Ingrediente caseiro"
+    if any(w in t for w in ("toe", "soles", "feet", "foot", "heel")):
+        local, nome = "pé", f"{ing} no pé"
+    elif any(w in t for w in ("groin", "inner thigh", "creases")):
+        local, nome = "virilha", f"{ing} na virilha"
+    elif any(w in t for w in ("belly", "stomach fat", "navel", "belly button", "umbigo")):
+        local, nome = "barriga", f"{ing} na barriga"
+    elif any(w in t for w in ("drink", "teaspoon", "glass", "gut", "water", "lemon")):
+        local, nome = "para beber", f"{ing} para beber"
+    else:
+        local, nome = "uso caseiro", f"{ing} ({copia})"
+    iguais = {n.casefold(): n for n in existentes}
+    nome = iguais.get(nome.casefold(), nome)
+    if any(w in t for w in ("doctor", "never teach", "secret", "nobody tells", "lose a customer")):
+        gancho = "segredo"
+    elif any(w in t for w in ("watch", "pulls out", "dropping weight", "coming off", "seven days")):
+        gancho = "resultado"
+    elif any(w in t for w in ("stop", "warning", "never do", "danger")):
+        gancho = "alerta"
+    else:
+        gancho = "demonstracao"
+    if any(w in t for w in ("patient of mine", "my patients", "clinic", "hospital", "nurse")):
+        papel = "profissional de saude"
+    elif any(w in t for w in ("called liver", "acupressure", "meridian", "doctor")):
+        papel = "especialista"
+    else:
+        papel = "pessoa comum"
+    return {"nome": nome, "ingrediente": ing, "local": local, "origem": "claude",
+            "frase": frase, "gancho": gancho, "papel": papel}
+
+
 def analisar_copies() -> str:
-    """Identifies the copies still unknown. Never touches a copy the user corrected: those are not pending."""
-    if not _claude or not _claude():
-        raise Recusa("Claude Code nao instalado.")
+    """Identifies the copies still unknown using Claude Code + local Whisper semantic fallback."""
     if not _analise.acquire(blocking=False):
         raise Recusa("A analise ja esta rodando.")
     try:
@@ -1062,25 +1317,37 @@ def analisar_copies() -> str:
         if not pendentes:
             return "Nenhuma copy nova para analisar."
         shutil.rmtree(QUADROS, ignore_errors=True)
-        QUADROS.mkdir(parents=True)
+        QUADROS.mkdir(parents=True, exist_ok=True)
         amostras = []
         modelo = _carregar_whisper()
         for copia, key in pendentes:
             arquivo = copia.replace(" ", "_") + ".jpg"
-            url = _url_video(key) or _video_local(key)
+            url = _video_local(key, copia) or _url_video(key)
             try:
-                if url and _quadros(url, QUADROS / arquivo):
-                    amostras.append({"copy": copia, "arquivo": arquivo, "legenda": estado["posts"][key].get("titulo", "")[:200],
-                                     "fala": _fala_segura(url, modelo)})
+                if url:
+                    tem_q = _quadros(url, QUADROS / arquivo)
+                    fala = _fala_segura(url, modelo)
+                    if tem_q or fala:
+                        amostras.append({"copy": copia, "arquivo": arquivo, "legenda": estado["posts"].get(key, {}).get("titulo", "")[:200],
+                                         "fala": fala})
             except (OSError, subprocess.TimeoutExpired):
                 pass
         del modelo  # out of memory until the next analysis
-        existentes = sorted({c["nome"] for c in estado["config"]["criativos"].values()})
+        existentes = sorted({c["nome"] for c in estado["config"]["criativos"].values() if c.get("nome")})
         achados = {}
-        if amostras:
-            resposta = _perguntar_claude(pergunta(amostras, existentes), QUADROS)
-            achados = ler_resposta(resposta.get("result"), [a["copy"] for a in amostras], existentes)
-            estado["analise_uso"] = {"copies": len(amostras), "tokens": resposta.get("usage"), "em": int(time.time())}
+        if amostras and _claude and _claude():
+            try:
+                resposta = _perguntar_claude(pergunta(amostras, existentes), QUADROS)
+                achados = ler_resposta(resposta.get("result"), [a["copy"] for a in amostras], existentes)
+                estado["analise_uso"] = {"copies": len(amostras), "tokens": resposta.get("usage"), "em": int(time.time())}
+            except Exception:
+                pass
+        # Fallback for any copy where Claude CLI wasn't available or didn't return an answer
+        for a in amostras:
+            if a["copy"] not in achados:
+                fb_cls = _classificar_por_fala(a["copy"], a.get("fala", ""), existentes)
+                if fb_cls:
+                    achados[a["copy"]] = fb_cls
         falas = {a["copy"]: a["fala"][:500] for a in amostras}
         with lock:
             for copia, d in achados.items():
@@ -1254,8 +1521,9 @@ def mensagem(a: dict, agora: int) -> str:
     h = (agora - a["criado"]) // 3600
     dados = [f"Postado há {h}h" if h < 72 else f"Postado há {h // 24} dias"]
     dados = _rotulos(a) + dados
+    tag_es = "🇪🇸 " if a.get("idioma") == "es" else ""
     return "\n".join([
-        f"{ICONE[a['faixa']]} **{NOME_FAIXA[a['faixa']]} em {a['pagina']}**",
+        f"{ICONE[a['faixa']]} {tag_es}**{NOME_FAIXA[a['faixa']]} em {a['pagina']}**",
         " · ".join([f"{_vez(a['score'])} views ({_num(a['views'])} vs. {_num(a['mediana'])} de mediana{_e_no_fb(a)})"] + extra),
         " · ".join(dados),
         f"▶️ <{a['link']}>"])  # the <> stop Discord's preview, which for Facebook is only a login box
@@ -1264,8 +1532,9 @@ def mensagem(a: dict, agora: int) -> str:
 def mensagem_cedo(s: dict) -> str:
     base = f"{_num(s['esperado'])} esperadas para {s['horas']}h no ar" if s["por_idade"] else f"{_num(s['esperado'])} de mediana"
     titulo = "🚀 **JÁ VIRALIZANDO" if s["vezes"] >= dict(FAIXAS)["super"] else "⚡ **PODE VIRALIZAR"
+    tag_es = "🇪🇸 " if s.get("idioma") == "es" else ""
     return "\n".join([
-        f"{titulo} em {s['pagina']}**",
+        f"{tag_es}{titulo} em {s['pagina']}**",
         f"{_vez(s['vezes'])}: {_num(s['views'])} views com {s['horas']}h no ar ({base}{_e_no_fb(s)})",
         " · ".join(_rotulos(s) + ["Ainda subindo: vale acompanhar"]),
         f"▶️ <{s['link']}>"])
@@ -1485,9 +1754,20 @@ def enviar_relatorio() -> bool:
 def enviar_discord(url: str, texto: str) -> None:
     corpo = json.dumps({"content": texto[:1900], "allowed_mentions": {"parse": []}}).encode()
     # without a User-Agent of its own, Cloudflare in front of Discord answers 403 to urllib
-    req = urllib.request.Request(url, corpo, {"Content-Type": "application/json", "User-Agent": "Kakashi-Radar/1.0"})
-    with urllib.request.urlopen(req, timeout=20):
-        pass
+    ultima_exc = None
+    for espera in (0, 4, 12):
+        if espera:
+            time.sleep(espera)
+        try:
+            req = urllib.request.Request(url, corpo, {"Content-Type": "application/json", "User-Agent": "Kakashi-Radar/1.0"})
+            with urllib.request.urlopen(req, timeout=20):
+                if str(estado.get("erro") or "").startswith("O Discord nao recebeu"):
+                    estado["erro"] = ""
+                return
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            ultima_exc = e
+    if ultima_exc:
+        raise ultima_exc
 
 
 def avisar() -> int:
@@ -1584,9 +1864,9 @@ def _fases_agora(agora: int) -> tuple[list[dict], list[dict]]:
         pg = por_fb.get(r["dest"][3:])
         sid = f"{pg}|restricao|{r['key']}"
         if pg and not S["paginas"][pg].get("pausada") and sid not in estado["ignoradas"]:
-            suspeitas.append({"pg": pg, "pagina": S["paginas"][pg].get("nome", pg), "id": sid, "dest": r["dest"],
-                              "tipo": "restricao", "queda": r["queda"], "videos": RESTRICAO_VIDEOS, "melhor": 0,
-                              "views": r["views"], "link": r["link"]})
+            suspeitas.append({"pg": pg, "pagina": S["paginas"][pg].get("nome", pg), "idioma": roleta.idioma_de(S["paginas"][pg]),
+                              "id": sid, "dest": r["dest"], "tipo": "restricao", "queda": r["queda"],
+                              "videos": RESTRICAO_VIDEOS, "melhor": 0, "views": r["views"], "link": r["link"]})
     esperam = {s["pg"] for s in suspeitas} | {pg for pg, p in S["paginas"].items() if p.get("pausada")}  # see _auto_fase2
     for s in prontas:
         if s["tipo"] == "formato" and horas and s["pg"] not in esperam and (desde := estado["sugestoes_desde"].get(s["id"])):
@@ -1598,19 +1878,40 @@ def _sugestoes_agora(agora: int) -> list[dict]:
     return _fases_agora(agora)[0]
 
 
-def publico() -> dict:
+def publico(idioma: str | None = None) -> dict:
     agora = int(time.time())
+    lang_f = idioma if idioma in ("en", "es") else None
+    idiomas_d = _idiomas_dest()
+    mapa_av_id = postagem._mapa_idiomas_avatares()
     with lock:
-        linhas, contas = analisar(estado["posts"], estado["config"], agora)
+        posts_src = (
+            {k: p for k, p in estado["posts"].items() if idiomas_d.get(p.get("dest"), "en") == lang_f}
+            if lang_f else estado["posts"]
+        )
+        linhas, contas = analisar(posts_src, estado["config"], agora)
         cfg = estado["config"]
-        lidos = sum(1 for p in estado["posts"].values() if p.get("views") is not None)
+        lidos = sum(1 for p in posts_src.values() if p.get("views") is not None)
         formatos = ranking(linhas, "criativo")
-        videos_copy = Counter(p["formato"] for p in estado["posts"].values() if SO_COPIA_RE.match(p.get("formato") or ""))
+        videos_copy = Counter(p["formato"] for p in posts_src.values() if SO_COPIA_RE.match(p.get("formato") or ""))
         prontas, observa = _fases_agora(agora)
+        if lang_f:
+            prontas = [s for s in prontas if s.get("idioma", "en") == lang_f]
+            observa = [s for s in observa if s.get("idioma", "en") == lang_f]
         copies = [{"copy": c, "videos": n, "nome": (cfg["criativos"].get(c) or {}).get("nome", ""),
                    "origem": (cfg["criativos"].get(c) or {}).get("origem", ""),
                    **{k: (cfg["criativos"].get(c) or {}).get(k, "") for k in ("gancho", "papel", "frase")}}
                   for c, n in sorted(videos_copy.items(), key=lambda x: int(x[0].split()[1]))]
+        S_raw = postagem.roleta_dados()
+        S_view = (
+            {**S_raw, "paginas": {k: v for k, v in (S_raw.get("paginas") or {}).items() if roleta.idioma_de(v) == lang_f},
+             "avatares": {k: v for k, v in (S_raw.get("avatares") or {}).items() if roleta.idioma_de(v) == lang_f}}
+            if (S_raw and lang_f) else S_raw
+        )
+        conectadas_view = [c for c in postagem.contas().get("paginas", []) if not lang_f or postagem._idioma(c.get("idioma")) == lang_f]
+        av_tipos = sorted(
+            ({"num": n, **v} for n, v in cfg["tipos_avatar"].items() if not lang_f or mapa_av_id.get(str(n), "en") == lang_f),
+            key=lambda a: int(a["num"]),
+        )
         return {"config": {"piso_views": cfg["piso_views"], "min_posts": cfg["min_posts"], "piso_cedo": cfg["piso_cedo"],
                            "resumo_hora": cfg["resumo_hora"], "tem_webhook": bool(cfg["webhook"]),
                            "relatorio_hora": cfg["relatorio_hora"], "tem_webhook_relatorio": bool(cfg["webhook_relatorio"]),
@@ -1618,16 +1919,27 @@ def publico() -> dict:
                                                   "queda_videos", "queda_pct", "auto_fase2_h", "fase2_comentarios",
                                                   "fase3_comentarios", "fase2_amostra", "fase3_bons_pagina")},
                            "horarios_coleta": cfg["horarios_coleta"]},
-                "subindo": subindo(estado["posts"], cfg, agora), "avatares": ranking(linhas, "avatar"), "formatos": formatos,
-                "sugestoes": prontas, "observacao": observa, "sem_registro": sem_registro(linhas, cfg), "fracas": estado["fracas"],
+                "subindo": subindo(posts_src, cfg, agora), "avatares": ranking(linhas, "avatar"), "formatos": formatos,
+                "sugestoes": prontas, "observacao": observa, "sem_registro": sem_registro(linhas, cfg),
+                "fracas": copias_fracas(linhas, cfg) if lang_f else estado["fracas"],
                 "criativos_globais": criativos_globais(linhas, cfg),
-                "avatares_fracos": _fracos_na_roda(avatares_fracos(linhas, cfg), postagem.roleta_dados()),
-                "controle": comparar_controle(linhas, postagem.roleta_dados(), postagem.contas().get("paginas", []), agora),
+                "avatares_fracos": _fracos_na_roda(avatares_fracos(linhas, cfg), S_view, idioma=(lang_f or "en")),
+                "controle": comparar_controle(linhas, S_view, conectadas_view, agora),
                 "paginas": conselhos(linhas), "copies": copies,
-                "fotos": [n for n, _ in (_fotos() if _fotos else [])],
+                "fotos": list(postagem._mapa_fotos_avatares(lang_f).keys()) if lang_f == "es" else [n for n, _ in (_fotos() if _fotos else [])],
+                "fotos_v": (
+                    {str(n): int(f.stat().st_mtime) for n, f in postagem._mapa_fotos_avatares("es").items() if f.is_file()}
+                    if lang_f == "es"
+                    else {str(n): int(f.stat().st_mtime) for n, f in (_fotos() if _fotos else []) if f.is_file()}
+                ),
+                "avatares_trocados": cfg.get("avatares_trocados", {}),
+                "escala_cruzada": escala_cruzada(linhas, contas, cfg, idioma=lang_f),
+                "rclone_client": _status_rclone(),
                 "ganchos": ranking(linhas, "gancho"), "papeis": ranking(linhas, "papel"), "idades": ranking(linhas, "idade"),
-                "cabelos": ranking(linhas, "cabelo"), "opcoes": {"idade": list(IDADES), "cabelo": list(CABELOS)},
-                "avatares_tipo": sorted(({"num": n, **v} for n, v in cfg["tipos_avatar"].items()), key=lambda a: int(a["num"])),
+                "cabelos": ranking(linhas, "cabelo"), "sinergias": ranking(linhas, "sinergia"),
+                "horarios_rank": ranking(linhas, "faixa_horario"),
+                "opcoes": {"idade": list(IDADES), "cabelo": list(CABELOS)},
+                "avatares_tipo": av_tipos,
                 "analise": {"rodando": _analise.locked(), "erro": estado.get("analise_erro", ""),
                             "pendentes": len(copies_pendentes()) + len(avatares_pendentes())},
                 "ultima_coleta": estado["ultima_coleta"], "ultima_tentativa": estado["ultima_tentativa"],
@@ -1699,13 +2011,68 @@ def _relatorio_agora(_body: dict) -> str:
 
 
 def sem_registro(linhas: list[dict], cfg: dict) -> list[dict]:
-    """The biggest videos that passed a good video's views with no avatar or copy on record: most left the queue before
-    the radar existed, so only the user can say. Clickbait and split screen have no avatar of their own."""
+    """The biggest videos that passed a good video's views with no avatar or copy on record, prioritizing active
+    (non-paused) Roleta Pages first so paused Pages don't hide actionable videos."""
+    S = postagem.roleta_dados() or {}
+    conectadas = postagem.contas().get("paginas", [])
+    por_fb = {fb: pg for pg, fb in roleta.casar_paginas(S, conectadas).items()} if S else {}
+    pausadas_fb = {fb for fb, pg in por_fb.items() if (S.get("paginas", {}).get(pg) or {}).get("pausada")}
     faltam = [a for a in linhas if a["views"] >= cfg["fase2_views"] and a.get("formato") not in ("Clickbait", "Tela dividida")
               and not (a.get("avatar") and a.get("formato"))]
     return [{"key": a["key"], "pagina": a["pagina"].strip(), "link": a["link"], "views": a["views"], "score": a["score"], "capa": a.get("capa"),
+             "pausada": a["dest"][3:] in pausadas_fb,
              "avatar": a.get("avatar") or "", "copy": m[1] if (m := COPIA_RE.search(a.get("formato") or "")) else ""}
-            for a in sorted(faltam, key=lambda a: -a["views"])[:SEM_REGISTRO_TOP]]
+            for a in sorted(faltam, key=lambda a: (a["dest"][3:] in pausadas_fb, -a["views"]))[:SEM_REGISTRO_TOP]]
+
+
+def _auto_identificar_sem_registro(_body: dict) -> str:
+    """Automatically attempts to identify the copy of high-view unlinked videos by transcribing their audio via Meta source URL
+    and matching against known copies' opening sentences."""
+    with lock:
+        linhas, _ = analisar(estado["posts"], estado["config"], int(time.time()))
+        alvos = sem_registro(linhas, estado["config"])
+        frases_conhecidas = {
+            c: (d.get("fala") or d.get("frase") or "").lower().strip()
+            for c, d in estado["config"].get("criativos", {}).items()
+            if (d.get("fala") or d.get("frase"))
+        }
+    if not alvos:
+        return "Nenhum video pendente de identificacao."
+    modelo = _carregar_whisper()
+    if not modelo:
+        raise Recusa("Modelo Whisper nao disponivel neste PC.")
+    identificados = 0
+    for item in alvos[:6]:
+        if item.get("copy"):
+            continue
+        key = item["key"]
+        url = _url_video(key)
+        if not url:
+            continue
+        fala = _fala_segura(url, modelo).lower()
+        if not fala:
+            continue
+        melhor_copy, melhor_sim = None, 0.0
+        palavras_v = set(re.findall(r"[a-z]{3,}", fala[:220]))
+        if not palavras_v:
+            continue
+        for c, f_ref in frases_conhecidas.items():
+            palavras_r = set(re.findall(r"[a-z]{3,}", f_ref[:220]))
+            if not palavras_r:
+                continue
+            sim = len(palavras_v & palavras_r) / max(len(palavras_v | palavras_r), 1)
+            if sim > melhor_sim:
+                melhor_sim, melhor_copy = sim, c
+        if melhor_copy and melhor_sim >= 0.45:
+            with lock:
+                reg = estado["registro"].setdefault(key, {"avatar": None, "formato": None})
+                reg["formato"] = melhor_copy
+                if key in estado["posts"]:
+                    estado["posts"][key]["formato"] = melhor_copy
+                identificados += 1
+    if identificados:
+        _salvar()
+    return f"{identificados} video(s) tiveram a copy identificada automaticamente pelo audio." if identificados else "A Meta nao forneceu o audio ou nenhuma copy bateu com seguranca." 
 
 
 def _rotular(body: dict) -> str:
@@ -1817,6 +2184,38 @@ def _avatar_fraco(body: dict) -> str:
     return f"Avatar {n} pausado na Roleta. Crie um avatar novo para repor a vaga."
 
 
+def registrar_troca_avatar(num: int, idade: str | None = None, cabelo: str | None = None, idioma: str = "en") -> None:
+    """When an avatar's face is replaced while keeping its number: videos posted before now stop counting against the
+    new face, its age/hair traits are updated (or cleared), and its slot stays active."""
+    lang = "es" if str(idioma or "").lower() == "es" else "en"
+    n = str(num)
+    chave_av = f"es:{n}" if lang == "es" else n
+    agora = int(time.time())
+    with lock:
+        estado["config"].setdefault("avatares_trocados", {})[chave_av] = agora
+        if lang == "en":
+            if idade and cabelo:
+                estado["config"].setdefault("tipos_avatar", {})[n] = {"idade": idade, "cabelo": cabelo, "origem": "flow"}
+            else:
+                estado["config"].get("tipos_avatar", {}).pop(n, None)
+            estado.get("avatares_fracos", {}).pop(n, None)
+            if n in estado.get("avatares_fracos_avisados", []):
+                estado["avatares_fracos_avisados"].remove(n)
+            if n in estado.get("avatares_fracos_ignorados", []):
+                estado["avatares_fracos_ignorados"].remove(n)
+        estado["analise_erro"] = ""
+        _salvar()
+    with postagem.roleta_lock:
+        S = postagem.roleta_dados()
+    if S:
+        for avid, a_obj in S.get("avatares", {}).items():
+            if roleta.idioma_de(a_obj) == lang and roleta.numero_avatar(S, avid) == n and a_obj.get("ativo") is False:
+                postagem.roleta_gravar({"op": "update", "caminho": f"avatares/{avid}", "dados": {"ativo": True}})
+                break
+    tag = " (ES)" if lang == "es" else ""
+    postagem._log(f"Avatar {n}{tag}: rosto trocado mantendo o numero #{n} (placar anterior zerado no radar)")
+
+
 def _coletar_agora(_body: dict) -> str:
     if _coleta.locked():
         raise Recusa("A coleta ja esta rodando.")
@@ -1834,9 +2233,172 @@ def _rodar() -> None:
         _salvar()
 
 
+def _status_rclone() -> dict:
+    try:
+        import nuvem_sync
+        return nuvem_sync.status_rclone_client()
+    except Exception:
+        return {"proprio": False, "client_id": ""}
+
+
+def _salvar_rclone_client(body: dict) -> str:
+    try:
+        import nuvem_sync
+        return nuvem_sync.configurar_rclone_client(str(body.get("client_id") or ""), str(body.get("client_secret") or ""))
+    except ValueError as e:
+        raise Recusa(str(e)) from None
+    except Exception as e:
+        raise Recusa(f"Erro ao salvar Client ID: {e}") from None
+
+
+def escala_cruzada(linhas: list[dict], contas: list[dict], cfg: dict, idioma: str | None = None) -> list[dict]:
+    """Identifies proven Super-Champion videos (Avatar X + Copy Y) that exploded on one Page and finds the strongest
+    active Pages where that exact video has not been posted yet, plus checks if a LipSync ES version exists."""
+    S = postagem.roleta_dados() or {}
+    conectadas = postagem.contas().get("paginas", [])
+    casadas = roleta.casar_paginas(S, conectadas) if S else {}
+    por_fb = {fb: pg for pg, fb in casadas.items()}
+    medianas = {c["dest"]: (c.get("mediana") or 0) for c in contas if c.get("pronta")}
+    # Track which (dest, avatar, formato) or (dest, formato) already ran or are queued
+    ja_rodou: set[tuple[str, str, str]] = set()
+    for p in estado["posts"].values():
+        if p.get("dest") and p.get("avatar") and p.get("formato"):
+            ja_rodou.add((p["dest"], str(p["avatar"]), str(p["formato"])))
+    with postagem.lock:
+        for it in postagem.fila.get("itens", []):
+            av = postagem._avatar(it.get("nome", ""), solto=True)
+            fmt = _formato(it)
+            if av and fmt:
+                for d in it.get("destinos", []):
+                    ja_rodou.add((d, str(av), str(fmt)))
+    # Active candidate target pages (not paused in Roleta, connected, Phases 1 or 2)
+    pags_ativas = []
+    for c in conectadas:
+        dest = f"fb:{c['id']}"
+        pg_id = por_fb.get(c["id"])
+        p_rol = (S.get("paginas", {}).get(pg_id) or {}) if pg_id else {}
+        if p_rol.get("pausada") or p_rol.get("fase") == 3:
+            continue
+        lang_c = postagem._idioma(c.get("idioma"))
+        if idioma in ("en", "es") and lang_c != idioma:
+            continue
+        pags_ativas.append({"dest": dest, "nome": c["nome"], "idioma": lang_c, "fase": p_rol.get("fase") or 1,
+                            "formatoFixo": p_rol.get("formatoFixo") or "", "mediana": medianas.get(dest, 0)})
+    pags_ativas.sort(key=lambda x: -x["mediana"])
+
+    melhores_par: dict[tuple[str, str], dict] = {}
+    for a in linhas:
+        av, fmt = a.get("avatar"), a.get("formato")
+        if not av or not fmt or not SO_COPIA_RE.match(fmt) or not _avatar_valido(a, cfg):
+            continue
+        if not ((a["score"] >= 3.0 and a["views"] >= cfg["fase2_views"]) or (a.get("comments") or 0) >= 25 or a["views"] >= 15000):
+            continue
+        par = (str(av), str(fmt))
+        if par not in melhores_par or a["views"] > melhores_par[par]["views"]:
+            melhores_par[par] = a
+
+    pasta_es = postagem.OUTPUT / "lipsync_es"
+    arquivos_es = [f.name.lower() for f in pasta_es.glob("*.mp4")] if pasta_es.is_dir() else []
+
+    out = []
+    for (av, fmt), a in sorted(melhores_par.items(), key=lambda kv: (-kv[1]["views"], -(kv[1].get("comments") or 0))):
+        arq = _arquivo_campeao(a["key"], av, fmt)
+        criativo = a.get("criativo") or fmt
+        alvos = []
+        for p in pags_ativas:
+            if p.get("idioma", "en") != a.get("idioma", "en"):
+                continue
+            if p["dest"] == a["dest"] or (p["dest"], av, fmt) in ja_rodou:
+                continue
+            if p["fase"] == 2 and p["formatoFixo"] and p["formatoFixo"].lower() != criativo.lower():
+                continue
+            alvos.append({"dest": p["dest"], "nome": p["nome"], "mediana": round(p["mediana"])})
+            if len(alvos) >= 3:
+                break
+        if not alvos:
+            continue
+        num_copy = fmt.split()[1]
+        tem_es = any(f"avatar {av}" in n and f"copy {num_copy}" in n or f"avatar{av}" in n for n in arquivos_es)
+        out.append({
+            "id": f"av{av}_{fmt.replace(' ', '')}",
+            "key": a["key"],
+            "avatar": av,
+            "formato": fmt,
+            "criativo": criativo,
+            "pagina_origem": a["pagina"].strip(),
+            "views": a["views"],
+            "score": a["score"],
+            "comments": a.get("comments") or 0,
+            "retem6": a.get("retem6"),
+            "queda_s": a.get("queda_s"),
+            "capa": a.get("capa"),
+            "link": a["link"],
+            "arquivo_disp": True,
+            "tem_es": tem_es,
+            "alvos": alvos,
+        })
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _arquivo_campeao(key: str, avatar: str, formato: str) -> Path | None:
+    vid = key.partition(":")[2]
+    with postagem.lock:
+        for i in postagem.fila.get("itens", []):
+            if any(r.get("id") == vid for r in (i.get("resultados") or {}).values()):
+                f = postagem.VIDEOS / i.get("arquivo", "")
+                if f.is_file():
+                    return f
+    m = re.search(r"\d+", formato)
+    if not m:
+        return None
+    cnum = int(m.group(0))
+    av_num = int(avatar) if avatar.isdigit() else avatar
+    padrao_re = re.compile(rf"avatar[\s_-]*0*{av_num}\b.*copy[\s_-]*0*{cnum}\b", re.I)
+    pastas = [postagem.VIDEOS, postagem.DIR / "_lixeira"]
+    drive_p = Path(postagem.fila.get("config", {}).get("pasta_drive") or r"G:\Meu Drive\Non Shop\001\Postagens")
+    if drive_p.is_dir():
+        pastas.extend([drive_p / "_Rodízio", drive_p, drive_p.parent / "_kakashi_nuvem" / "videos"])
+    for pasta in pastas:
+        if not pasta.is_dir():
+            continue
+        for f in pasta.glob("*.mp4"):
+            if padrao_re.search(f.stem):
+                return f
+    return None
+
+
+def _escalar_campeao(body: dict) -> str:
+    key = str(body.get("key") or "").strip()
+    avatar = str(body.get("avatar") or "").strip()
+    formato = str(body.get("formato") or "").strip()
+    destinos = [str(d) for d in (body.get("destinos") or []) if str(d).startswith("fb:")]
+    if not avatar or not formato or not destinos:
+        raise Recusa("Selecione um video campeao e pelo menos uma Pagina de destino.")
+    arq = _arquivo_campeao(key, avatar, formato)
+    mover_temp = False
+    if not arq or not arq.is_file():
+        url = _url_video(key) if key else None
+        if not url:
+            raise Recusa(f"Arquivo de Avatar {avatar} {formato} nao encontrado no disco nem na Meta.")
+        QUADROS.mkdir(parents=True, exist_ok=True)
+        arq = QUADROS / f"escala_av{avatar}_{formato.replace(' ', '')}.mp4"
+        req = urllib.request.Request(url, headers={"User-Agent": "Kakashi-Radar/1.0"})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            arq.write_bytes(resp.read())
+        mover_temp = True
+    pid0 = destinos[0].partition(":")[2]
+    quando = postagem.proximo_horario(pid0)
+    nome_item = f"Avatar {avatar} {formato} (Escala Cruzada).mp4"
+    postagem.adicionar(arq, "kakashi", nome_item, mover=mover_temp, destinos=destinos, quando=quando)
+    return f"Avatar {avatar} ({formato}) adicionado em Rascunhos para {len(destinos)} Pagina(s) forte(s)!"
+
+
 ACOES = {"config": _configurar, "testar": _testar, "coletar": _coletar_agora, "resumo": _resumo_agora,
          "relatorio": _relatorio_agora, "rotular": _rotular, "formato": _nomear_formato, "sugestao": _responder_sugestao, "analisar": _analisar_agora,
-         "avatar": _corrigir_avatar, "avatar-fraco": _avatar_fraco}
+         "avatar": _corrigir_avatar, "avatar-fraco": _avatar_fraco, "auto-identificar": _auto_identificar_sem_registro,
+         "escalar": _escalar_campeao, "rclone-client": _salvar_rclone_client}
 
 
 def _url_video(key: str) -> str | None:
@@ -1859,7 +2421,10 @@ def _url_video(key: str) -> str | None:
 
 def get(h, path: str) -> None:
     if path == "/api/radar/estado":
-        return h.send_json(publico())
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(h.path).query)
+        lang = (q.get("idioma") or [""])[0].strip().lower()
+        return h.send_json(publico(lang if lang in ("en", "es") else None))
     if path == "/api/radar/relatorio.pdf":
         try:
             pdf = relatorio_pdf()
@@ -1871,8 +2436,15 @@ def get(h, path: str) -> None:
         h.end_headers()
         return h.wfile.write(pdf)
     if path.startswith("/radar-foto/"):
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(h.path).query)
+        lang_q = (q.get("idioma") or ["en"])[0].strip().lower()
+        num_s = path[len("/radar-foto/"):]
+        if lang_q == "es":
+            fotos_es = {str(n): f for n, f in postagem._mapa_fotos_avatares("es").items()}
+            return h.send_file(fotos_es.get(num_s), "image/jpeg")
         fotos = {str(n): f for n, f in (_fotos() if _fotos else [])}
-        return h.send_file(fotos.get(path[len("/radar-foto/"):]), "image/jpeg")
+        return h.send_file(fotos.get(num_s), "image/jpeg")
     if path.startswith("/radar-capa/"):
         return h.send_file(postagem._dentro(CAPAS, path[len("/radar-capa/"):]), "image/jpeg")
     if path.startswith("/radar-video/"):
@@ -2031,7 +2603,11 @@ def _priorizar() -> None:
         return
     casadas = roleta.casar_paginas(S, postagem.contas().get("paginas", []))
     with lock:
-        contas = analisar(estado["posts"], estado["config"], agora)[1]
+        linhas, contas = analisar(estado["posts"], estado["config"], agora)
+        cfg = estado["config"]
+        av_rank = {str(r["chave"]): r for r in ranking(linhas, "avatar")}
+        sin_rank = {r["chave"]: r for r in ranking(linhas, "sinergia")}
+        fracos_av = set(avatares_fracos(linhas, cfg).keys())
     normal = {c["dest"][3:]: c["mediana"] for c in contas if c["pronta"]}
     prontas, observa = _fases_agora(agora)
     perto: dict[str, float] = {}
@@ -2049,11 +2625,19 @@ def _priorizar() -> None:
             return 2, -(m or 0)
         return (3, 0) if m is None else (4, -m)
 
-    ordem = sorted((p for p in roleta.paginas(S) if p.get("fase") != 3 and not p.get("pausada")), key=chave)
-    nova = {p["id"]: n for n, p in enumerate(ordem, 1)}
+    nova = {}
+    for lang_p in ("en", "es"):
+        ordem_l = sorted((p for p in roleta.paginas(S, lang_p) if p.get("fase") != 3 and not p.get("pausada")), key=chave)
+        for n_ord, p_item in enumerate(ordem_l, 1):
+            nova[p_item["id"]] = n_ord
     with postagem.roleta_lock:
         S = postagem.roleta_dados() or {}
         mudou = False
+        # Map creative names to their copy role (papel) for Phase 2 synergy matching
+        papel_por_criativo = {}
+        for d_cr in cfg.get("criativos", {}).values():
+            if d_cr.get("nome") and d_cr.get("papel"):
+                papel_por_criativo[d_cr["nome"].strip().lower()] = d_cr["papel"]
         for pid, p in S.get("paginas", {}).items():
             if p.get("prioridade") != nova.get(pid):
                 mudou = True
@@ -2061,6 +2645,26 @@ def _priorizar() -> None:
                     p["prioridade"] = nova[pid]
                 else:
                     p.pop("prioridade", None)
+            if p.get("fase") == 2 and p.get("formatoFixo"):
+                papel_p = papel_por_criativo.get(str(p.get("formatoFixo") or "").strip().lower(), "")
+                boas = sorted([id_v for id_v in IDADES if papel_p and (sin_rank.get(f"{papel_p} + {id_v}") or {}).get("score_bayes", 0) >= 1.0])
+                if p.get("idades_boas") != boas:
+                    p["idades_boas"] = boas
+                    mudou = True
+        for avid, a in S.get("avatares", {}).items():
+            num = roleta.numero_avatar(S, avid)
+            rk = av_rank.get(num or "")
+            if num in fracos_av or (rk and rk["videos"] >= 4 and rk["score_bayes"] < 0.75):
+                merito = 0
+            elif rk and (rk["score_bayes"] >= 1.15 or rk.get("score_copy", 0) >= 1.15 or rk["outliers"] >= 1):
+                merito = 2
+            else:
+                merito = 1
+            idade_av = (cfg.get("tipos_avatar", {}).get(num or "") or {}).get("idade") or ""
+            if a.get("merito") != merito or a.get("idade") != idade_av:
+                a["merito"] = merito
+                a["idade"] = idade_av
+                mudou = True
         if mudou:
             S["alterada_em"] = agora
             postagem._write(postagem.ROLETA_FILE, S)
