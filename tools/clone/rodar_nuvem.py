@@ -251,7 +251,26 @@ def main() -> int:
     postagem._checar_atrasos()
     depois_conf = json.dumps(postagem.fila.get("itens", []), sort_keys=True)
 
-    # 3. Run Radar checks & collection if due
+    # 3. Radar: runs in its own workflow step (--radar) AFTER the queue is handed back and the next run is chained,
+    # so a slow collection can never eat the job's time limit and lose the posting state (11/11/2026: the job hit
+    # its 45 min limit while collecting and was cancelled before handing the queue back).
+    if "--sem-radar" not in sys.argv:
+        _rodar_radar(inicio_exec)
+
+    # 4. Stamp cloud completion so the PC imports the updated state when it wakes up
+    _salvar_checkpoint_nuvem(enviados, forcar=(antes_conf != depois_conf))
+    print(f"[Kakashi Nuvem] Concluido com sucesso ({enviados} disparo(s) de postagem).", flush=True)
+    return 0
+
+
+RADAR_MAX_INICIO_S = 25 * 60  # do not start a collection this late into a run
+
+
+def _rodar_radar(inicio_exec: float) -> bool:
+    """Radar checks and collection if due. Returns True when a collection ran."""
+    if time.time() - inicio_exec > RADAR_MAX_INICIO_S:
+        print("[Kakashi Nuvem] Radar adiado: pouco tempo restante nesta execucao.", flush=True)
+        return False
     try:
         radar.registrar()
         radar._avisar_tokens()
@@ -267,14 +286,22 @@ def main() -> int:
             postagem._log(f"Radar (Nuvem): {res_radar}")
             print(f"[Kakashi Nuvem] Radar concluido: {res_radar}", flush=True)
             _rclone_safe("copyto", str(postagem.DIR / "radar.json"), f"{GDRIVE_NUVEM}/radar.json", timeout=60, retries=2)
+            return True
     except Exception as e:
         print(f"[Kakashi Nuvem] Erro no Radar: {e}", flush=True)
+    return False
 
-    # 4. Stamp cloud completion so the PC imports the updated state when it wakes up
-    _salvar_checkpoint_nuvem(enviados, forcar=(antes_conf != depois_conf))
-    print(f"[Kakashi Nuvem] Concluido com sucesso ({enviados} disparo(s) de postagem).", flush=True)
+
+def main_radar() -> int:
+    """Separate workflow step: Radar only, after the queue was handed back to Drive."""
+    inicio = time.time()
+    if _pc_acordou_agora():
+        print("[Kakashi Nuvem] PC acordado: radar fica com o PC.", flush=True)
+        return 0
+    if _rodar_radar(inicio) and not _pc_acordou_agora():
+        _salvar_checkpoint_nuvem(0, forcar=True)  # new nuvem_em so the PC imports the fresh radar.json
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main_radar() if "--radar" in sys.argv else main())

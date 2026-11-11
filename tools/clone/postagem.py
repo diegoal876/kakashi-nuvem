@@ -1848,11 +1848,38 @@ def _ritmo_txt() -> str:
             "deixe o Kakashi aberto ate terminar.")
 
 
+NUVEM_ESPERA_MAX_S = 15 * 60  # longest the PC waits for the cloud check before posting anyway
+_inicio_painel = time.time()
+
+
+def _esperando_nuvem() -> bool:
+    """On the PC, no send before the cloud state was checked (nuvem_sync imported what GitHub Actions posted while
+    the PC was off). On 11/11/2026 the panel posted an overdue video a minute before that import and the Reel went
+    out twice. The cloud runner itself never waits; without the cloud tools, nothing to wait for."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        return False
+    try:
+        import nuvem_sync
+    except Exception:
+        return False
+    if not nuvem_sync.RCLONE_EXE.is_file() or nuvem_sync._estado_sync.get("checou_nuvem"):
+        return False
+    if time.time() - _inicio_painel > NUVEM_ESPERA_MAX_S:
+        if not _esperando_nuvem.__dict__.get("avisou"):
+            _esperando_nuvem.avisou = True
+            _log("Nuvem: nao consegui conferir o que o GitHub Actions postou em 15 min; voltando a postar mesmo assim.")
+        return False
+    if not _esperando_nuvem.__dict__.get("logou"):
+        _esperando_nuvem.logou = True
+        _log("Nuvem: esperando conferir o que foi postado com o PC desligado antes de postar.")
+    return True
+
+
 def _postar_devidos() -> None:
     """One send to Meta per pass, at most one every ENVIO_INTERVALO_S, the earliest time first. A video scheduled
     far ahead is handed to Meta in its turn (Meta then holds it); one whose time is less than NATIVO_MIN_S away
     waits for its time and goes out directly."""
-    if fila.get("bloqueio") or time.time() - _envio["ultimo"] < ENVIO_INTERVALO_S:
+    if fila.get("bloqueio") or time.time() - _envio["ultimo"] < ENVIO_INTERVALO_S or _esperando_nuvem():
         return
     agora = time.time()
     with lock:
