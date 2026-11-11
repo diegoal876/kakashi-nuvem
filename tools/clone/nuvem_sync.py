@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -175,8 +176,9 @@ def _garantir_vigia_nuvem(forcar_disparo: bool = False) -> None:
         pass
 
 
-def _ao_encerrar_pc() -> None:
-    """When the PC shuts down, logs off, or closes Kakashi, zero out heartbeat_pc.json on Drive and wake up GitHub Actions."""
+def _ao_encerrar_pc(manter_vivo: bool = False) -> None:
+    """When the PC shuts down, logs off, sleeps/hibernates, or closes Kakashi, zero out heartbeat_pc.json on Drive
+    and wake up GitHub Actions immediately."""
     if _estado_sync.get("encerrando"):
         return
     _estado_sync["encerrando"] = True
@@ -191,17 +193,113 @@ def _ao_encerrar_pc() -> None:
                     shutil.copy2(src_fila, nuvem / "fila.json")
                 except OSError:
                     pass
-            _rclone_cmd("copyto", str(hb), f"{GDRIVE_NUVEM}/heartbeat_pc.json", timeout=10)
+            _rclone_cmd("copyto", str(hb), f"{GDRIVE_NUVEM}/heartbeat_pc.json", timeout=8)
             if (nuvem / "fila.json").is_file():
-                _rclone_cmd("copyto", str(nuvem / "fila.json"), f"{GDRIVE_NUVEM}/fila.json", timeout=15)
-        if _tem_agendados_proximos(12 * 3600):
+                _rclone_cmd("copyto", str(nuvem / "fila.json"), f"{GDRIVE_NUVEM}/fila.json", timeout=12)
+        if _tem_agendados_proximos(18 * 3600):
             _garantir_vigia_nuvem(forcar_disparo=True)
+    except Exception:
+        pass
+    finally:
+        if manter_vivo:
+            # After sleep/resume, allow export again once the PC wakes back up
+            _estado_sync["encerrando"] = False
+
+
+def _iniciar_vigia_energia_win32() -> None:
+    """Create a hidden top-level Win32 window so even a consoleless pythonw.exe process receives
+    WM_QUERYENDSESSION / WM_ENDSESSION (shutdown/restart/logoff) and WM_POWERBROADCAST (sleep/hibernate)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        WM_QUERYENDSESSION = 0x0011
+        WM_ENDSESSION = 0x0016
+        WM_POWERBROADCAST = 0x0218
+        PBT_APMSUSPEND = 0x0004
+        PBT_APMRESUMESUSPEND = 0x0007
+        PBT_APMRESUMEAUTOMATIC = 0x0012
+
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = LRESULT
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        def _wnd_proc(hwnd, msg, wparam, lparam):
+            try:
+                if msg == WM_QUERYENDSESSION:
+                    _ao_encerrar_pc(manter_vivo=False)
+                    return 1
+                if msg == WM_ENDSESSION and wparam:
+                    _ao_encerrar_pc(manter_vivo=False)
+                    return 0
+                if msg == WM_POWERBROADCAST:
+                    if wparam == PBT_APMSUSPEND:
+                        _ao_encerrar_pc(manter_vivo=True)
+                    elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                        _estado_sync["encerrando"] = False
+                        _estado_sync["checou_nuvem"] = False
+            except Exception:
+                pass
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        wnd_proc_ref = WNDPROC(_wnd_proc)
+        _estado_sync["_wnd_proc_ref"] = wnd_proc_ref
+
+        def _loop():
+            try:
+                hinst = kernel32.GetModuleHandleW(None)
+                cls_name = f"KakashiPowerWatch_{os.getpid()}"
+                wc = WNDCLASSW()
+                wc.lpfnWndProc = wnd_proc_ref
+                wc.hInstance = hinst
+                wc.lpszClassName = cls_name
+                user32.RegisterClassW(ctypes.byref(wc))
+                hwnd = user32.CreateWindowExW(0, cls_name, cls_name, 0, 0, 0, 0, 0, None, None, hinst, None)
+                _estado_sync["hwnd_power"] = int(hwnd or 0)
+                if not hwnd:
+                    return
+                msg = wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception as e:
+                _estado_sync["erro_power"] = str(e)
+
+        threading.Thread(target=_loop, name="kakashi-power-watch", daemon=True).start()
     except Exception:
         pass
 
 
 atexit.register(_ao_encerrar_pc)
-if sys.platform == "win32":
+if sys.platform == "win32" and not os.environ.get("GITHUB_ACTIONS"):
     try:
         import ctypes
         _HANDLER_PROTO = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
@@ -216,6 +314,8 @@ if sys.platform == "win32":
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_ctrl_ref, 1)
     except Exception:
         pass
+    if Path(sys.argv[0]).name == "painel.py":
+        _iniciar_vigia_energia_win32()
 
 
 def _ler_json(path: Path) -> dict | None:
@@ -343,7 +443,14 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
     _estado_sync["checou_nuvem"] = True
     _estado_sync["ultimo"] = agora
 
-    _gravar_json(nuvem / "heartbeat_pc.json", {"em": int(agora), "hora": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _gravar_json(
+        nuvem / "heartbeat_pc.json",
+        {
+            "em": int(agora),
+            "hora": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "hwnd": int(_estado_sync.get("hwnd_power") or 0),
+        },
+    )
 
     mudou_json = False
     for nome in ARQUIVOS_JSON:
