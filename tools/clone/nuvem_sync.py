@@ -42,7 +42,16 @@ def pasta_nuvem() -> Path | None:
     if drive_postagens.parent.is_dir():
         return drive_postagens.parent / "_kakashi_nuvem"
     padrao = Path(r"G:\Meu Drive\_kakashi_nuvem")
-    return padrao if padrao.parent.is_dir() else None
+    if padrao.parent.is_dir():
+        return padrao
+    if RCLONE_EXE.is_file():
+        cache = postagem.DIR / "_nuvem_cache"
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            return cache
+        except OSError:
+            return None
+    return None
 
 
 def _rclone_conf_path() -> Path:
