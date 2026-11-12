@@ -1739,9 +1739,18 @@ def _partes(blocos: list[str], limite: int = 1900) -> list[str]:
     return partes
 
 
+extras_relatorio: list = []  # other modules' blocks for the morning report (the Spy's), each returns list[str]
+
+
 def enviar_relatorio() -> bool:
     url = estado["config"]["webhook_relatorio"] or estado["config"]["webhook"]
-    partes = _partes(relatorio_blocos(int(time.time())))
+    blocos = relatorio_blocos(int(time.time()))
+    for extra in extras_relatorio:
+        try:
+            blocos = blocos + extra()
+        except Exception:  # a broken extra never holds back the report
+            pass
+    partes = _partes(blocos)
     if not url or not partes:
         return False
     for n, texto in enumerate(partes):
