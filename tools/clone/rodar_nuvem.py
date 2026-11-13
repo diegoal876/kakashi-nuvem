@@ -88,6 +88,12 @@ def _proximo_vencimento() -> float | None:
             rest = [d for d in postagem._restantes(item) if d.partition(":")[2] not in caidas]
             if rest:
                 q = item.get("quando") or agora
+                if q <= agora:
+                    # Overdue but held by the 3h rule: wait for the time _respiro gives, not the old one.
+                    # 13/11/2026: the Sentinel kept saying "next in ~1 min (07:09)" for the rest of the run.
+                    adiados = [t for d in rest if (t := postagem._respiro(item, d, agora))]
+                    if adiados:
+                        q = min(adiados)
                 tempos.append(float(q))
             else:
                 # Also wake up to confirm agendado_meta posts 3 min after their scheduled time
@@ -146,6 +152,7 @@ def _salvar_checkpoint_nuvem(enviados: int, forcar: bool = False) -> None:
     so waking the PC mid-run never loses progress."""
     if enviados <= 0 and not forcar:
         return
+    _copiar_fila_nuvem()
     status_file = postagem.DIR / "nuvem_status.json"
     try:
         status_file.write_text(
@@ -154,7 +161,19 @@ def _salvar_checkpoint_nuvem(enviados: int, forcar: bool = False) -> None:
         )
     except OSError:
         pass
-    _rclone_safe("copy", str(postagem.DIR), GDRIVE_NUVEM, "--max-depth", "1", "--include", "{fila,nuvem_status}.json", timeout=60, retries=3)
+    _rclone_safe("copy", str(postagem.DIR), GDRIVE_NUVEM, "--max-depth", "1", "--include",
+                 "{fila,fila_nuvem,nuvem_status}.json", timeout=60, retries=3)
+
+
+def _copiar_fila_nuvem() -> None:
+    """fila_nuvem.json: the cloud's own copy of the queue, which only GitHub Actions writes. The PC imports from it,
+    so a stale fila.json uploaded later by the PC side (Drive for desktop, 13/11/2026) cannot hide what was posted."""
+    try:
+        with postagem.lock:
+            postagem._salvar()
+        shutil.copy2(postagem.FILA_FILE, postagem.DIR / "fila_nuvem.json")
+    except OSError:
+        pass
 
 
 def _esperar_preparando(timeout_s: int = 60) -> None:
@@ -259,6 +278,7 @@ def main() -> int:
 
     # 4. Stamp cloud completion so the PC imports the updated state when it wakes up
     _salvar_checkpoint_nuvem(enviados, forcar=(antes_conf != depois_conf))
+    _copiar_fila_nuvem()  # the workflow's last step uploads it with fila.json
     print(f"[Kakashi Nuvem] Concluido com sucesso ({enviados} disparo(s) de postagem).", flush=True)
     return 0
 

@@ -119,7 +119,10 @@ jobs:
       - name: Devolver fila e Radar atualizados para o Google Drive
         if: always() && steps.check_pc.outputs.pc_ativo != 'true' && steps.postar.outcome != 'skipped'
         run: |
-          for arq in fila.json contas.json roleta.json radar.json nuvem_status.json; do
+          # fila_nuvem.json: the cloud's own copy, written only here, which the PC imports (13/11/2026). Copied even
+          # when the poster failed, so what it saved before failing still reaches the PC.
+          if [ -f "$POSTAGEM_DIR/fila.json" ]; then cp "$POSTAGEM_DIR/fila.json" "$POSTAGEM_DIR/fila_nuvem.json"; fi
+          for arq in fila.json fila_nuvem.json contas.json roleta.json radar.json nuvem_status.json; do
             if [ -f "$POSTAGEM_DIR/$arq" ]; then
               rclone copyto "$POSTAGEM_DIR/$arq" "gdrive:Non Shop/001/_kakashi_nuvem/$arq"
             fi

@@ -34,16 +34,15 @@ _estado_sync = {
 
 
 def pasta_nuvem() -> Path | None:
+    """Local staging folder for the cloud exchange, OUTSIDE the Google Drive for desktop mirror (G:).
+    13/11/2026: the PC wrote fila.json into G:\\...\\_kakashi_nuvem at shutdown; when the PC came back, Drive for
+    desktop finished uploading that stale copy over the fila.json GitHub Actions had written all night, the import
+    found nothing, and the PC re-posted 4 videos the cloud had already posted. Every transfer now goes through rclone
+    only, so no second writer can touch the cloud's files."""
     env = os.environ.get("KAKASHI_NUVEM_DIR")
     if env:
         p = Path(env)
         return p if p.parent.is_dir() else None
-    drive_postagens = Path(postagem.fila.get("config", {}).get("pasta_drive") or r"G:\Meu Drive\Postagens")
-    if drive_postagens.parent.is_dir():
-        return drive_postagens.parent / "_kakashi_nuvem"
-    padrao = Path(r"G:\Meu Drive\_kakashi_nuvem")
-    if padrao.parent.is_dir():
-        return padrao
     if RCLONE_EXE.is_file():
         cache = postagem.DIR / "_nuvem_cache"
         try:
@@ -363,10 +362,13 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
     if not nuvem_em or nuvem_em <= ultimo_imp:
         return False, True
 
-    _rclone_cmd("copy", GDRIVE_NUVEM, str(nuvem), "--max-depth", "1", "--include", "{fila,contas,roleta,radar}.json", timeout=30)
+    _rclone_cmd("copy", GDRIVE_NUVEM, str(nuvem), "--max-depth", "1", "--include",
+                "{fila,fila_nuvem,contas,roleta,radar}.json", timeout=30)
 
     mudou = False
-    fila_nuvem = _ler_json(nuvem / "fila.json")
+    # fila_nuvem.json is written only by GitHub Actions, so nothing on the PC side can have overwritten it;
+    # fila.json is the fallback for a cloud runner from before 13/11/2026
+    fila_nuvem = _ler_json(nuvem / "fila_nuvem.json") or _ler_json(nuvem / "fila.json")
     if isinstance(fila_nuvem, dict):
         with postagem.lock:
             por_id = {i["id"]: i for i in postagem.fila.get("itens", [])}
@@ -493,6 +495,8 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
             "*.json",
             "--exclude",
             "nuvem_status.json",
+            "--exclude",
+            "fila_nuvem.json",
             timeout=25,
         )
 
