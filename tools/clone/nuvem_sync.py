@@ -506,6 +506,12 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
             "fila_nuvem.json",
             timeout=25,
         )
+        _estado_sync["ultimo_hb_rclone"] = agora
+    elif agora - _estado_sync.get("ultimo_hb_rclone", 0.0) >= 60:
+        # The heartbeat on its own every minute: GitHub Actions takes the PC for off after 4 min without it, and the
+        # full upload above runs only every 3 min (Drive for desktop no longer carries it, since 13/11/2026)
+        _estado_sync["ultimo_hb_rclone"] = agora
+        _rclone_cmd("copyto", str(nuvem / "heartbeat_pc.json"), f"{GDRIVE_NUVEM}/heartbeat_pc.json", timeout=40)
 
     v_nuvem = nuvem / "videos"
     try:
