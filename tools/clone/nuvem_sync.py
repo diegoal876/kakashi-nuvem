@@ -353,7 +353,8 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
         return False, False
     # Pull nuvem_status.json directly via rclone only when exigir_rede is True (startup / wake from sleep)
     if exigir_rede:
-        rede_ok = _rclone_cmd("copyto", f"{GDRIVE_NUVEM}/nuvem_status.json", str(nuvem / "nuvem_status.json"), timeout=15)
+        # 60 s: on 13/11/2026 this small download took 5-40 s and the old 15 s limit failed it for 4 min
+        rede_ok = _rclone_cmd("copyto", f"{GDRIVE_NUVEM}/nuvem_status.json", str(nuvem / "nuvem_status.json"), timeout=60)
         if not rede_ok and RCLONE_EXE.is_file():
             return False, False
     st = _ler_json(nuvem / "nuvem_status.json") or {}
@@ -450,6 +451,12 @@ def exportar_para_nuvem(forcar: bool = False) -> None:
     precisa_rede = forcar or gap_sono or not _estado_sync["checou_nuvem"]
     _, rede_ok = importar_da_nuvem(exigir_rede=precisa_rede)
     if not rede_ok:
+        # The check failed, so nothing is exported, but the heartbeat still goes up: the PC is on, and GitHub Actions
+        # must not take over and post the same queue meanwhile. (Before 13/11/2026 Drive for desktop carried it.)
+        hb = nuvem / "heartbeat_pc.json"
+        _gravar_json(hb, {"em": int(agora), "hora": time.strftime("%Y-%m-%d %H:%M:%S"),
+                          "hwnd": int(_estado_sync.get("hwnd_power") or 0)})
+        _rclone_cmd("copyto", str(hb), f"{GDRIVE_NUVEM}/heartbeat_pc.json", timeout=45)
         return
     _estado_sync["checou_nuvem"] = True
     _estado_sync["ultimo"] = agora
