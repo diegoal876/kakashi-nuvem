@@ -29,13 +29,29 @@ def avatares(S: dict, idioma: str | None = None) -> list[dict]:
     return sorted(itens, key=_ordem)
 
 
+def repostagem(p: dict | None) -> bool:
+    """The Page runs the Repostagem model (since 13/11/2026): 1 avatar a day, new copies plus reposts of its own MP4s,
+    no phases. Off by default: the switch is per Page, on the Roleta."""
+    return (p or {}).get("modelo") == "repostagem"
+
+
+def fase_efetiva(p: dict | None) -> int:
+    """The phase the old rules see: a Repostagem Page has none, so it counts as phase 1 (no official avatar kept)."""
+    return 1 if repostagem(p) else ((p or {}).get("fase") or 1)
+
+
 def _oficiais(S: dict, idioma: str | None = None) -> dict:
     # a paused Page (restricted by Meta) lends its official avatar back to the wheel until it comes back
     return {p["avatarOficial"]: p["id"] for p in paginas(S, idioma)
-            if p.get("fase") == 3 and not p.get("pausada") and p.get("avatarOficial") in S.get("avatares", {})}
+            if fase_efetiva(p) == 3 and not p.get("pausada") and p.get("avatarOficial") in S.get("avatares", {})}
 
 
 AVATARES_POR_PAGINA = 3  # phases 1-2, one video of each a day (since 02/11/2026; it was 2)
+AVATARES_REPOSTAGEM = 1  # a Repostagem Page: 1 avatar a day, the same in all its new copies
+
+
+def avatares_da_pagina(p: dict) -> int:
+    return AVATARES_REPOSTAGEM if repostagem(p) else AVATARES_POR_PAGINA
 
 
 def _num_dia(data: str) -> int:  # numDia: days since 1970-01-01
@@ -48,7 +64,8 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
     dia = S.get("dias", {}).get(data)
     if dia:
         dia_pags = dia.get("paginas") or {}
-        fixadas = {pid: e.get("avatares") or [] for pid, e in dia_pags.items() if pid in ids_lang}
+        fixadas = {pid: (e.get("avatares") or [])[:avatares_da_pagina(S["paginas"][pid])] for pid, e in dia_pags.items()
+                   if pid in ids_lang}
         if fixadas:
             return fixadas
     k, of = _num_dia(data), _oficiais(S, lang)
@@ -66,11 +83,11 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
                     m = ultimo.setdefault(pid, {})
                     if a not in m or m[a] < d["data"]:
                         m[a] = d["data"]
-    for pi, p in enumerate(sorted((x for x in pags if x.get("fase") != 3), key=lambda x: x.get("prioridade") or 999)):
+    for pi, p in enumerate(sorted((x for x in pags if fase_efetiva(x) != 3), key=lambda x: x.get("prioridade") or 999)):
         escolhidos = []
-        eh_fase2 = p.get("fase") == 2
+        eh_fase2 = fase_efetiva(p) == 2
         idades_boas = set(p.get("idades_boas") or []) if eh_fase2 else set()
-        for s in range(AVATARES_POR_PAGINA):
+        for s in range(avatares_da_pagina(p)):
             alvo = (AVATARES_POR_PAGINA * (pi + k) + s) % n if n else 0
             melhor, m_chave = None, None
             for ai, a in enumerate(pool):
@@ -87,7 +104,7 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
             escolhidos.append(melhor["id"] if melhor else None)
         res[p["id"]] = escolhidos
     for p in pags:
-        if p.get("fase") == 3:
+        if fase_efetiva(p) == 3:
             o = p.get("avatarOficial")
             res[p["id"]] = [o if o in S.get("avatares", {}) else None]
     return res

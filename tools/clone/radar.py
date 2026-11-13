@@ -99,6 +99,9 @@ VENCEDOR_TAXA = 5           # ...and this share of good videos (%)
 ARRISCADO_RESTRICOES = 2    # a creative that was the main one of this many restricted Pages...
 ARRISCADO_PCT = 25          # ...this share of the Pages it ran on (%), is a risk, not a winner
 SEM_CRIATIVO = ("Clickbait", "Tela dividida")  # formats with no creative of their own
+REPOSTS = ("Repost", "Remix")  # Repostagem (13/11/2026): the same MP4 again, or the champion in a new format; never in the median
+DEPOIS_COLETA: list = []      # Repostagem hooks run after each collection
+RELATORIO_EXTRA: list = []    # Repostagem hooks: (agora) -> (discord lines, html) for the morning report
 QUEDA_VIDEOS = 5            # a Page goes back a phase on its latest videos of what it keeps, with none of them good...
 QUEDA_PCT = 70              # ...and their median this far below the Page's videos before them
 RESTRICAO_VIDEOS = 3        # a Page's latest videos, of any format, that all stall...
@@ -560,7 +563,7 @@ def analisar(posts: dict, cfg: dict, agora: int) -> tuple[list[dict], list[dict]
     for dest, lista in _grupos(posts).items():
         lang_d = idiomas_d.get(dest, "en")
         todos = _maduros(lista, agora)
-        maduros = todos[:MAX_POSTS]
+        maduros = [p for p in todos if p.get("formato") not in REPOSTS][:MAX_POSTS]  # the Page's normal: new videos only
         base = _mediana_robusta(maduros)
         taxas = [e for p in maduros if (e := _eng(p)) is not None]
         comp = [p["shares"] / p["views"] for p in maduros if p.get("shares") is not None and p["views"]]
@@ -595,6 +598,7 @@ def analisar(posts: dict, cfg: dict, agora: int) -> tuple[list[dict], list[dict]
                            "recente": n < MAX_POSTS,
                            "janela_fases": (agora - p["criado"]) <= 30 * 86400 or n < MAX_POSTS * 2,
                            "capa": p.get("capa"),
+                           "repost": p.get("formato") in REPOSTS,
                            "views": views_v, "plays_total": p.get("plays_total"), "replay_x": replay_x,
                            "mediana": base, "score": score, "score_copy": score, "faixa": faixa, "motivo": motivo,
                            "shares": p.get("shares"), "comments": p.get("comments"), "taxa_comm": taxa_comm,
@@ -813,7 +817,7 @@ def _fracos_na_roda(fracos: dict, S: dict | None, idioma: str = "en") -> dict[st
         return {}
     lang = "es" if str(idioma or "").lower() == "es" else "en"
     por_numero = {roleta.numero_avatar(S, a): a for a, obj in S.get("avatares", {}).items() if roleta.idioma_de(obj) == lang}
-    oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if p.get("fase") == 3}
+    oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if roleta.fase_efetiva(p) == 3}
     return {n: {**f, "avid": por_numero[n]} for n, f in fracos.items()
             if n in por_numero and n not in estado["avatares_fracos_ignorados"]
             and S["avatares"][por_numero[n]].get("ativo") is not False and por_numero[n] not in oficiais}
@@ -998,7 +1002,7 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
         for lang in ("en", "es")
     }
     por_fb = {fb: pg for pg, fb in roleta.casar_paginas(S, conectadas).items()}
-    oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if p.get("fase") == 3}
+    oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if roleta.fase_efetiva(p) == 3}
     por_numero = {
         (roleta.idioma_de(S["avatares"][a]), n): a
         for a in S.get("avatares", {})
@@ -1016,6 +1020,8 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
     out, observa = [], []
     for pg, lista in por_pagina.items():
         p = S["paginas"].get(pg) or {}
+        if roleta.repostagem(p):  # no phases there: the Repostagem rules decide (repostagem.py)
+            continue
         lang_pg = roleta.idioma_de(p)
         globais = globais_por_lang.get(lang_pg, {})
         base = {"pg": pg, "pagina": p.get("nome", pg), "idioma": lang_pg}
@@ -1612,6 +1618,8 @@ def relatorio_dados(agora: int) -> dict | None:
         if p.get("pausada"):  # restricted by Meta: nothing goes there until the user brings it back
             pausadas.append(nome(p["id"]))
             continue
+        if roleta.repostagem(p):  # its own block (RELATORIO_EXTRA)
+            continue
         if p.get("fase") == 3:
             numero = roleta.numero_avatar(S, p.get("avatarOficial"))
             deles = _reels_pagina(lista, "avatar", numero)
@@ -1637,6 +1645,13 @@ def relatorio_dados(agora: int) -> dict | None:
             "observacao": [linha(s, f"{regra(s)} · {s['falta']}") for s in observa]}
 
 
+def _extra_relatorio(f, agora: int) -> tuple[list[str], str]:
+    try:
+        return f(agora) or ([], "")
+    except Exception as e:  # a hook must never take the report down
+        return [f"(Repostagem: não consegui montar este bloco: {e})"], ""
+
+
 def relatorio_blocos(agora: int) -> list[str]:
     """The report for Discord, one block per Page so a long report never splits one."""
     d = relatorio_dados(agora)
@@ -1651,6 +1666,7 @@ def relatorio_blocos(agora: int) -> list[str]:
             *(["⚠️ **Conexão com a Meta caída:** os números abaixo podem estar atrasados."] if d["meta"] else []),
             "\n🔒 **FASE 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)**", *([_bloco_pagina(*x) for x in d["fase3"]] or vazio),
             "\n🟢 **FASE 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia**", *([_bloco_pagina(*x) for x in d["fase2"]] or vazio),
+            *[linha for f in RELATORIO_EXTRA for linha in _extra_relatorio(f, agora)[0]],
             *([f"\n⏸️ **PAUSADAS (restrição na Meta): não postar** · {', '.join(d['pausadas'])}"] if d.get("pausadas") else []),
             "\n🔥 **VIRALIZARAM NAS ÚLTIMAS 24H**", *(virais or ["Nenhum vídeo nas últimas 24h."]),
             *(["\n🔻 **Caíram muito, falta confirmar a volta de fase: não mudar nada ainda**", *voltar] if voltar else []),
@@ -1701,6 +1717,7 @@ tr {{ break-inside: avoid; }} td a {{ color: #1d4ed8; white-space: nowrap; }} td
 {'<p class="alerta">Conexão com a Meta caída: os números abaixo podem estar atrasados.</p>' if d["meta"] else ""}
 <h2 class="f3">Fase 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)</h2>{_html_paginas(d["fase3"])}
 <h2 class="f2">Fase 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia</h2>{_html_paginas(d["fase2"])}
+{"".join(_extra_relatorio(f, d["agora"])[1] for f in RELATORIO_EXTRA)}
 {f'<h2 class="queda">Pausadas por restrição na Meta: não postar</h2><p>{escape(", ".join(d["pausadas"]))}</p>' if d.get("pausadas") else ""}
 <h2 class="virais">Viralizaram nas últimas 24h</h2>{f'<div class="lista-virais">{virais}</div>' if virais else '<p class="vazio">Nenhum vídeo nas últimas 24h.</p>'}
 {f'<h2 class="queda">Caíram muito, falta confirmar a volta de fase: não mudar nada ainda</h2>{_html_tabela(d["voltar"])}' if d["voltar"] else ""}
@@ -2286,7 +2303,7 @@ def escala_cruzada(linhas: list[dict], contas: list[dict], cfg: dict, idioma: st
         dest = f"fb:{c['id']}"
         pg_id = por_fb.get(c["id"])
         p_rol = (S.get("paginas", {}).get(pg_id) or {}) if pg_id else {}
-        if p_rol.get("pausada") or p_rol.get("fase") == 3:
+        if p_rol.get("pausada") or p_rol.get("fase") == 3 or roleta.repostagem(p_rol):
             continue
         lang_c = postagem._idioma(c.get("idioma"))
         if idioma in ("en", "es") and lang_c != idioma:
@@ -2295,8 +2312,11 @@ def escala_cruzada(linhas: list[dict], contas: list[dict], cfg: dict, idioma: st
                             "formatoFixo": p_rol.get("formatoFixo") or "", "mediana": medianas.get(dest, 0)})
     pags_ativas.sort(key=lambda x: -x["mediana"])
 
+    exclusivas = {f"fb:{fb}" for pg, fb in casadas.items() if roleta.repostagem(S.get("paginas", {}).get(pg))}
     melhores_par: dict[tuple[str, str], dict] = {}
     for a in linhas:
+        if a["dest"] in exclusivas:  # Repostagem: the champion MP4 never leaves its Page
+            continue
         av, fmt = a.get("avatar"), a.get("formato")
         if not av or not fmt or not SO_COPIA_RE.match(fmt) or not _avatar_valido(a, cfg):
             continue
@@ -2564,6 +2584,11 @@ def _depois_da_coleta() -> None:
             estado["restricao_avisada"][s["dest"]] = s["id"]
     estado["restricao_avisada"] = {d: v for d, v in estado["restricao_avisada"].items() if d in vistas}
     _salvar()
+    for f in DEPOIS_COLETA:
+        try:
+            f()
+        except Exception as e:  # a hook must never stop the radar
+            estado["erro"] = f"Erro na Repostagem depois da coleta: {e}"
 
 
 _auto = {"em": 0.0}

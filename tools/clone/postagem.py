@@ -1284,10 +1284,34 @@ def _no_dia(pid: str, dia: datetime) -> list[dict]:
     return [i for i in _da_pagina(pid, *_janela(dia)) if i["status"] != "erro"]
 
 
-def _cabe(S: dict, rid: str, pid: str, dia: datetime, n: str | None = None) -> bool:
+VAGAS_REPOSTAGEM = 3  # a Repostagem Page posts 3 a day: new copies + reposts of its own MP4s
+EXTRA_PASSOS: list = []  # worker steps other modules add (repostagem.py)
+
+
+def _rep():
+    return sys.modules.get("repostagem")  # loaded by the panel; read here only, so no import cycle
+
+
+def _cabe_repostagem(rid: str, pid: str, dia: datetime, n: str | None, nome: str | None) -> bool:
+    """Repostagem (13/11/2026): only the day's avatar, as many new copies as the day has (2 without a champion, 1
+    with one, 3 with nothing to repost), never a copy the Page already posted, and room left for the reposts."""
+    if n is None:
+        return False  # an avatar without a Page never goes to a Repostagem Page: it has 1 avatar a day
+    itens = _no_dia(pid, dia)
+    ineditos = [i for i in itens if not i.get("repost_de")]
+    rep = _rep()
+    cota = rep.ineditos_do_dia(rid, dia.date().isoformat()) if rep else 2
+    if len(itens) >= VAGAS_REPOSTAGEM or len(ineditos) >= cota:
+        return False
+    return not (nome and rep and rep.copia_ja_na_pagina(pid, nome))
+
+
+def _cabe(S: dict, rid: str, pid: str, dia: datetime, n: str | None = None, nome: str | None = None) -> bool:
     """With n, one of the Page's avatars of that day: it has room for its own video (1 in phases 1-2, 3 for the official
     one), up to the Page's daily limit (por_pagina). Without n, a video of an avatar the Roleta left without a Page:
     it only takes a place the Page still has that day after reserving its own Roleta avatars."""
+    if roleta.repostagem(S["paginas"].get(rid)):
+        return _cabe_repostagem(rid, pid, dia, n, nome)
     por_avatar, por_pagina = COTA_FASE.get(S["paginas"].get(rid, {}).get("fase"), COTA_PADRAO)
     itens = _no_dia(pid, dia)
     if len(itens) >= por_pagina:
@@ -1328,7 +1352,7 @@ def _vaga_sem_pagina(S: dict, casadas: dict, dia: datetime, agora: float, idioma
     plano_dia = roleta.plano(S, dia.date().isoformat(), idioma=lang)
     livres = [(rid, p) for rid, pid in casadas.items()
               if roleta.idioma_de(S["paginas"].get(rid)) == lang
-              and S["paginas"].get(rid, {}).get("fase") != 3
+              and S["paginas"].get(rid, {}).get("fase") != 3 and not roleta.repostagem(S["paginas"].get(rid))
               and not S["paginas"].get(rid, {}).get("pausada") and (p := _pagina(pid))]
 
     def _ocupacao(item_rp: tuple[str, dict]) -> tuple[int, int, int]:
@@ -1362,7 +1386,10 @@ def _vaga_roleta(nome: str, idioma: str | None = None) -> tuple[dict, int] | Non
             if lugar := _vaga_sem_pagina(S, casadas, dia, agora, idioma=lang):
                 return lugar
             continue
-        if _cabe(S, rid, pagina["id"], dia, n) and (t := _vaga_no_dia(pagina["id"], dia, agora)):
+        if _cabe(S, rid, pagina["id"], dia, n, nome) and (t := _vaga_no_dia(pagina["id"], dia, agora)):
+            rep = _rep()
+            if rep and roleta.repostagem(S["paginas"].get(rid)):
+                t = rep.horario_inedito(pagina["id"], dia, agora) or t
             return pagina, t
     return None
 
@@ -1441,6 +1468,7 @@ def roleta_publica() -> dict | None:
     casadas, plano = roleta.casar_paginas(S, contas().get("paginas", [])), roleta.plano(S, data_ref)
     return {"data": data_ref, "alterada_em": S.get("alterada_em") or S.get("copiada_em", 0), "paginas": [
         {"nome": p.get("nome", ""), "idioma": roleta.idioma_de(p), "fase": p.get("fase") or 1, "pagina": casadas.get(p["id"], ""), "pausada": bool(p.get("pausada")),
+         "modelo": "repostagem" if roleta.repostagem(p) else "fases",
          "avatares": [roleta.numero_avatar(S, a) for a in plano.get(p["id"], []) if a]} for p in roleta.paginas(S)]}
 
 
@@ -1893,6 +1921,8 @@ def _ja_na_meta(iid: int, dest: str, pagina: dict) -> dict | None:
         dur = float((item.get("info") or {}).get("dur") or 0)
         desde = int(min(item.get("criado") or time.time(), item.get("quando") or time.time())) - 3600
         conhecidos = {r.get("id") for i in fila["itens"] for r in i.get("resultados", {}).values() if r.get("id")}
+        if item.get("repost_de") and (rep := _rep()):
+            conhecidos |= rep.ids_do_mp4(item["repost_de"])
     if not dur:
         return None
     try:
@@ -2319,7 +2349,8 @@ def _manter_acordado() -> None:
 def _worker() -> None:
     while True:
         for passo in (_manter_acordado, _sincronizar_nuvem, _checar_tokens, _auto_paginas, _scan_entrada, _scan_drive, _scan_kakashi,
-                      _repor_auto, _postar_devidos, _acompanhar_meta, _conferir_meta, _checar_atrasos, _limpar_postados):
+                      _repor_auto, *EXTRA_PASSOS, _postar_devidos, _acompanhar_meta, _conferir_meta, _checar_atrasos,
+                      _limpar_postados):
             try:
                 passo()
             except Exception as e:  # keep the loop alive whatever one pass hits
@@ -2795,8 +2826,12 @@ def _avisos_dia() -> dict[int, list[str]]:
     criativos, fracas = dados.get("config", {}).get("criativos", {}), dados.get("fracas", {})
     av_fracos, av_mantidos = dados.get("avatares_fracos", {}), set(dados.get("avatares_fracos_ignorados", []))
     S = roleta_dados() or {}
-    fase1 = {pid for rid, pid in roleta.casar_paginas(S, contas().get("paginas", [])).items()
-             if (S["paginas"][rid].get("fase") or 1) == 1 and not S["paginas"][rid].get("pausada")} if S else set()
+    casadas_d = roleta.casar_paginas(S, contas().get("paginas", [])) if S else {}
+    rep_pids = {pid for rid, pid in casadas_d.items() if roleta.repostagem(S["paginas"][rid])}
+    fase1 = {pid for rid, pid in casadas_d.items()
+             if roleta.fase_efetiva(S["paginas"][rid]) == 1 and not S["paginas"][rid].get("pausada")}
+    rep = _rep()
+    familia = (lambda c, nome: rep.familia(c, nome)) if rep else (lambda c, nome: nome)
     vistos, out, do_dia = {}, {}, {}
     ativos = ("preparando", "rascunho", "agendado")
     for i in sorted(fila["itens"], key=lambda i: (i.get("quando") or 0, i["id"])):
@@ -2818,13 +2853,13 @@ def _avisos_dia() -> dict[int, list[str]]:
                                                f"(o melhor fez {f['melhor']:,} views).".replace(",", "."))
         for pid in {d.partition(":")[2] for d in i["destinos"]}:
             antes = vistos.setdefault((pid, data), (criativo, copia))
-            if antes[0] != criativo and i["status"] in ativos:
+            if antes[0] != criativo and i["status"] in ativos and pid not in rep_pids:
                 nome = (_pagina(pid) or {}).get("nome", "A Pagina")
                 out.setdefault(i["id"], []).append(f"Uma copy por Página por dia: {nome} já tem a {antes[1]} em "
                                                    f"{time.strftime('%d/%m', dia)} e este vídeo é a {copia}.")
             if pid in fase1:
                 lang_pg = _idioma((_pagina(pid) or {}).get("idioma"))
-                do_dia.setdefault((lang_pg, data), []).append((i, criativo))
+                do_dia.setdefault((lang_pg, data), []).append((i, familia(copia, criativo)))
     for (lang_pg, data), lista in do_dia.items():
         if len(lista) < CRIATIVO_MIN_VIDEOS:
             continue
@@ -2832,7 +2867,7 @@ def _avisos_dia() -> dict[int, list[str]]:
             if 100 * n <= CRIATIVO_MAX_PCT * len(lista):
                 continue
             tag_l = " [ES]" if lang_pg == "es" else ""
-            texto = (f"{criativo}{tag_l} está em {n} de {len(lista)} vídeos da Fase 1 em {data[8:]}/{data[5:7]}: o limite é "
+            texto = (f"{criativo}{tag_l} está em {n} de {len(lista)} vídeos da Fase 1 e da Repostagem em {data[8:]}/{data[5:7]}: o limite é "
                      f"{CRIATIVO_MAX_PCT}%, deixe pelo menos {100 - CRIATIVO_MAX_PCT}% para testar criativos novos.")
             for i, c in lista:
                 if c == criativo and i["status"] in ativos and texto not in out.get(i["id"], []):
