@@ -1875,6 +1875,45 @@ def _esperando_nuvem() -> bool:
     return True
 
 
+# Last lock before posting a LATE video (13/11/2026: the cloud had posted 131 videos at night, the PC did not get
+# that state back and re-posted 4 of them). A video this late is checked on the Page first.
+TRAVA_ATRASO_S = 10 * 60
+TRAVA_TOLERANCIA_S = 0.25  # Meta's length vs our ffprobe: up to 0.15 s apart on 13/11/2026
+
+
+def _ja_na_meta(iid: int, dest: str, pagina: dict) -> dict | None:
+    """The result to record when the Page already has this video: a Facebook video with the same length (within
+    TRAVA_TOLERANCIA_S) posted since the item entered the queue, whose id no item of the queue knows. Only an unknown
+    post counts (normally every post on the Page is in the queue), so a video the queue already holds never blocks
+    another one. If Meta cannot be asked, None: the video goes out as before."""
+    with lock:
+        item = _item(iid)
+        if not item or not dest.startswith("fb:"):
+            return None
+        dur = float((item.get("info") or {}).get("dur") or 0)
+        desde = int(min(item.get("criado") or time.time(), item.get("quando") or time.time())) - 3600
+        conhecidos = {r.get("id") for i in fila["itens"] for r in i.get("resultados", {}).values() if r.get("id")}
+    if not dur:
+        return None
+    try:
+        dados = graph("GET", f"{pagina['id']}/videos", pagina["token"], fields="id,created_time,length",
+                      since=desde, limit=50)
+    except (GraphError, OSError) as e:
+        _log(f"Trava: nao consegui conferir na Meta antes de postar atrasado ({e}); envio normal · {_nome_destino(dest)}")
+        return None
+    for v in dados.get("data", []):
+        if not v.get("id") or v["id"] in conhecidos:
+            continue
+        if abs(float(v.get("length") or 0) - dur) <= TRAVA_TOLERANCIA_S:
+            try:
+                em = int(datetime.strptime(v["created_time"], "%Y-%m-%dT%H:%M:%S%z").timestamp())
+            except (KeyError, ValueError):
+                em = int(time.time())
+            return {"id": v["id"], "tipo": "reels", "link": f"https://www.facebook.com/reel/{v['id']}/",
+                    "estado": "ok", "em": em, "conf": "ok", "trava": True}
+    return None
+
+
 def _postar_devidos() -> None:
     """One send to Meta per pass, at most one every ENVIO_INTERVALO_S, the earliest time first. A video scheduled
     far ahead is handed to Meta in its turn (Meta then holds it); one whose time is less than NATIVO_MIN_S away
@@ -1904,6 +1943,20 @@ def _postar_devidos() -> None:
             path, legenda, info = VIDEOS / item["arquivo"], item["legenda"], item["info"]
             quando = item["quando"] if meta else None
             pagina = _pagina(dest.partition(":")[2])
+            atrasado = not meta and (item.get("quando") or agora) < agora - TRAVA_ATRASO_S
+            nome_item = item["nome"]
+        if atrasado and pagina and (achado := _ja_na_meta(iid, dest, pagina)):
+            with lock:
+                if item := _item(iid):
+                    item["resultados"][dest] = achado
+                    item["andamento"] = ""
+                    item.pop("tentativas", None)
+                    if not _restantes(item):
+                        item["status"] = _status_final(item, time.time())
+                    _salvar()
+            _log(f"Ja estava na Meta, nao repostei · {_nome_destino(dest)} · {nome_item} · saiu em "
+                 f"{_quando_txt(achado['em'])} (mesma duracao, video que a fila nao conhecia)")
+            continue
         bloqueio, restrita = None, False
         try:
             if not pagina:
