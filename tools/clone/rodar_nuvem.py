@@ -296,7 +296,8 @@ def _rodar_radar(inicio_exec: float) -> bool:
         radar._avisar_tokens()
         radar._priorizar()
         radar._auto_fase2()
-        radar._relatorio_do_dia()
+        # 14/11/2026: o relatório da manhã fica só no PC. A Nuvem não tem repostagem.py nem spy.py, então o relatório
+        # dela saía sem os blocos da Repostagem e do Spy, e o PC importava relatorio_dia e não mandava o completo.
         radar._resumo_do_dia()
         if postagem.contas().get("paginas") and radar.coleta_devida(
             datetime.now(), radar.estado["ultima_tentativa"], radar.estado["config"]["horarios_coleta"]

@@ -102,6 +102,8 @@ SEM_CRIATIVO = ("Clickbait", "Tela dividida")  # formats with no creative of the
 REPOSTS = ("Repost", "Remix")  # Repostagem (13/11/2026): the same MP4 again, or the champion in a new format; never in the median
 DEPOIS_COLETA: list = []      # Repostagem hooks run after each collection
 RELATORIO_EXTRA: list = []    # Repostagem hooks: (agora) -> (discord lines, html) for the morning report
+RESUMO_EXTRA: list = []       # Repostagem hooks: (agora) -> list of parts for the last line of the 21h summary
+ORIGINAL_DE: list = []        # Repostagem hooks: (post key) -> link of the original video of a repost, or None
 QUEDA_VIDEOS = 5            # a Page goes back a phase on its latest videos of what it keeps, with none of them good...
 QUEDA_PCT = 70              # ...and their median this far below the Page's videos before them
 RESTRICAO_VIDEOS = 3        # a Page's latest videos, of any format, that all stall...
@@ -758,7 +760,8 @@ def restricoes_suspeitas(posts: dict, agora: int) -> list[dict]:
     avatar: how a Meta restriction looks from here. Meta does not say it, so this only asks the user to look."""
     out = []
     for dest, lista in _grupos(posts).items():
-        lista = sorted(lista, key=lambda p: -p["criado"])
+        # 14/11/2026: reposts run below the new videos by nature, so they would look like a stall
+        lista = sorted((p for p in lista if p.get("formato") not in REPOSTS), key=lambda p: -p["criado"])
         novos = [p for p in lista if agora - p["criado"] >= RESTRICAO_MIN_H * 3600][:RESTRICAO_VIDEOS]
         if len(novos) < RESTRICAO_VIDEOS or agora - novos[-1]["criado"] > RESTRICAO_DIAS * 86400:
             continue
@@ -1528,22 +1531,43 @@ def mensagem(a: dict, agora: int) -> str:
     dados = [f"Postado há {h}h" if h < 72 else f"Postado há {h // 24} dias"]
     dados = _rotulos(a) + dados
     tag_es = "🇪🇸 " if a.get("idioma") == "es" else ""
+    rep = _repost(a)
     return "\n".join([
-        f"{ICONE[a['faixa']]} {tag_es}**{NOME_FAIXA[a['faixa']]} em {a['pagina']}**",
+        f"{ICONE[a['faixa']]} {tag_es}**{rep[0]}{NOME_FAIXA[a['faixa']]} em {a['pagina']}**",
         " · ".join([f"{_vez(a['score'])} views ({_num(a['views'])} vs. {_num(a['mediana'])} de mediana{_e_no_fb(a)})"] + extra),
         " · ".join(dados),
-        f"▶️ <{a['link']}>"])  # the <> stop Discord's preview, which for Facebook is only a login box
+        f"▶️ <{a['link']}>", *rep[1:]])  # the <> stop Discord's preview, which for Facebook is only a login box
+
+
+def _repost(a: dict) -> list[str]:
+    """14/11/2026: a repost of a known video is told apart from a new one, with its original when Repostagem knows it.
+    Returns [title prefix, *extra lines]; ["",] for a new video."""
+    p = estado["posts"].get(a.get("key")) or {}
+    formato = p.get("formato") or a.get("formato")
+    if formato not in REPOSTS:
+        return [""]
+    original = None
+    for f in ORIGINAL_DE:
+        try:
+            original = f(a["key"]) or original
+        except Exception:  # a hook must never stop a warning
+            pass
+    rotulo = "🔁 REPOST do campeão · " if formato == "Repost" else "🔁 REMIX do campeão · "
+    return [rotulo] + ([f"Original: <{original}>"] if original else [])
 
 
 def mensagem_cedo(s: dict) -> str:
     base = f"{_num(s['esperado'])} esperadas para {s['horas']}h no ar" if s["por_idade"] else f"{_num(s['esperado'])} de mediana"
     titulo = "🚀 **JÁ VIRALIZANDO" if s["vezes"] >= dict(FAIXAS)["super"] else "⚡ **PODE VIRALIZAR"
     tag_es = "🇪🇸 " if s.get("idioma") == "es" else ""
+    rep = _repost(s)
+    if rep[0]:
+        titulo = titulo.replace("**", "**" + rep[0], 1)
     return "\n".join([
         f"{tag_es}{titulo} em {s['pagina']}**",
         f"{_vez(s['vezes'])}: {_num(s['views'])} views com {s['horas']}h no ar ({base}{_e_no_fb(s)})",
         " · ".join(_rotulos(s) + ["Ainda subindo: vale acompanhar"]),
-        f"▶️ <{s['link']}>"])
+        f"▶️ <{s['link']}>", *rep[1:]])
 
 
 def resumo_texto(agora: int) -> str | None:
@@ -1564,6 +1588,11 @@ def resumo_texto(agora: int) -> str | None:
         linha += f", {_vez(a['score'])} o normal)" if a else ")"
         texto.append(" · ".join([linha] + _rotulos(p)) + f" ▶️ <{p['link']}>")
     fim = [f"{novos} novo(s) destaque(s)"] + ([f"{sugeridas} sugestão(ões) para a Roleta na aba Virais"] if sugeridas else [])
+    for f in RESUMO_EXTRA:  # 14/11/2026: the reposts waiting in draft for the user
+        try:
+            fim += f(agora) or []
+        except Exception:  # a hook must never take the summary down
+            pass
     return "\n".join(texto + [" · ".join(fim)])
 
 
@@ -1664,8 +1693,11 @@ def relatorio_blocos(agora: int) -> list[str]:
                          + _rotulos_reel(a)) + f" ▶️ <{a['link']}>" for a in d["virais"]]
     return [f"📋 **Relatório da manhã** ({datetime.fromtimestamp(agora):%d/%m}) · números lidos em {datetime.fromtimestamp(d['coleta']):%d/%m às %H:%M}",
             *(["⚠️ **Conexão com a Meta caída:** os números abaixo podem estar atrasados."] if d["meta"] else []),
-            "\n🔒 **FASE 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)**", *([_bloco_pagina(*x) for x in d["fase3"]] or vazio),
-            "\n🟢 **FASE 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia**", *([_bloco_pagina(*x) for x in d["fase2"]] or vazio),
+            # 14/11/2026: with the Pages on Repostagem the phase sections only said "Nenhuma Página nesta fase"
+            *(["\n🔒 **FASE 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)**", *([_bloco_pagina(*x) for x in d["fase3"]] or vazio)]
+              if d["fase3"] or not RELATORIO_EXTRA else []),
+            *(["\n🟢 **FASE 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia**", *([_bloco_pagina(*x) for x in d["fase2"]] or vazio)]
+              if d["fase2"] or not RELATORIO_EXTRA else []),
             *[linha for f in RELATORIO_EXTRA for linha in _extra_relatorio(f, agora)[0]],
             *([f"\n⏸️ **PAUSADAS (restrição na Meta): não postar** · {', '.join(d['pausadas'])}"] if d.get("pausadas") else []),
             "\n🔥 **VIRALIZARAM NAS ÚLTIMAS 24H**", *(virais or ["Nenhum vídeo nas últimas 24h."]),
@@ -1715,8 +1747,8 @@ tr {{ break-inside: avoid; }} td a {{ color: #1d4ed8; white-space: nowrap; }} td
 <h1>Relatório da manhã</h1>
 <p class="sub">{datetime.fromtimestamp(d["agora"]):%d/%m/%Y} · números lidos em {datetime.fromtimestamp(d["coleta"]):%d/%m às %H:%M}</p>
 {'<p class="alerta">Conexão com a Meta caída: os números abaixo podem estar atrasados.</p>' if d["meta"] else ""}
-<h2 class="f3">Fase 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)</h2>{_html_paginas(d["fase3"])}
-<h2 class="f2">Fase 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia</h2>{_html_paginas(d["fase2"])}
+{f'<h2 class="f3">Fase 3: avatar fixo, uma copy, 3 vídeos por dia (variações do viral)</h2>{_html_paginas(d["fase3"])}' if d["fase3"] or not RELATORIO_EXTRA else ""}
+{f'<h2 class="f2">Fase 2: manter o formato, uma copy, 1 vídeo de cada um dos 3 avatares por dia</h2>{_html_paginas(d["fase2"])}' if d["fase2"] or not RELATORIO_EXTRA else ""}
 {"".join(_extra_relatorio(f, d["agora"])[1] for f in RELATORIO_EXTRA)}
 {f'<h2 class="queda">Pausadas por restrição na Meta: não postar</h2><p>{escape(", ".join(d["pausadas"]))}</p>' if d.get("pausadas") else ""}
 <h2 class="virais">Viralizaram nas últimas 24h</h2>{f'<div class="lista-virais">{virais}</div>' if virais else '<p class="vazio">Nenhum vídeo nas últimas 24h.</p>'}
@@ -1831,7 +1863,8 @@ def _avisar_novas(url: str, agora: int) -> int:
     """A Page still without its normal has no bands and no ⚡: from NOVA_VIEWS a video of it is told anyway, once."""
     n = 0
     for dest, lista in _grupos(estado["posts"]).items() if url else []:
-        if len(_maduros(lista, agora)) >= estado["config"]["min_posts"]:
+        # 14/11/2026: the Page's normal counts new videos only (analisar), so the reposts do not count here either
+        if len([q for q in _maduros(lista, agora) if q.get("formato") not in REPOSTS]) >= estado["config"]["min_posts"]:
             continue
         for q in lista:
             p = estado["posts"][q["key"]]
@@ -2535,8 +2568,31 @@ def _avisar_tokens() -> None:
     _salvar()
 
 
-def _enviar_aviso(texto: str) -> bool:
+def _enviar_aviso(texto: str, funcionario: bool = False) -> bool:
+    """To the radar's channel. With funcionario=True it also goes to the employee's channel, when it is another one
+    (14/11/2026: what the employee acts on, such as a copy not to use). Counts as sent when the radar's channel got it."""
     url = estado["config"]["webhook"]
+    if not url:
+        return False
+    try:
+        enviar_discord(url, texto)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        estado["erro"] = f"O Discord nao recebeu o aviso: {e}"
+        return False
+    time.sleep(1.2)
+    outro = estado["config"].get("webhook_relatorio")
+    if funcionario and outro and outro != url:
+        try:
+            enviar_discord(outro, texto)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            estado["erro"] = f"O canal do funcionario nao recebeu o aviso: {e}"
+        time.sleep(1.2)
+    return True
+
+
+def enviar_funcionario(texto: str) -> bool:
+    """To the employee's channel (webhook_relatorio), or the radar's when there is none. 14/11/2026."""
+    url = estado["config"].get("webhook_relatorio") or estado["config"]["webhook"]
     if not url:
         return False
     try:
@@ -2561,15 +2617,18 @@ def _depois_da_coleta() -> None:
     for n, f in _fracos_na_roda(estado["avatares_fracos"], S).items():
         if n not in estado["avatares_fracos_avisados"] and _enviar_aviso(
                 f"🪦 **O Avatar {n} não funcionou**: {f['videos']} vídeos em {f['paginas']} Páginas, nenhum bom, rendendo "
-                f"{_vez(f['mediana'])} o normal de cada Página e {_num(f['comentarios'])} comentário{'s' if f['comentarios'] != 1 else ''} no total. Na aba Virais dá para "
-                "pausar ele na Roleta (crie um avatar novo para repor a vaga)."):
+                f"{_vez(f['mediana'])} o normal de cada Página e {_num(f['comentarios'])} comentário{'s' if f['comentarios'] != 1 else ''} no total. "
+                "Cada Página da Repostagem tem 1 avatar por dia e os ativos são 1 por Página: **crie um avatar novo antes** "
+                "de pausar este na aba Virais, senão uma Página fica sem avatar. A Roleta de amanhã trava ao meio-dia, "
+                "então depois disso a pausa só vale a partir de depois de amanhã."):
             estado["avatares_fracos_avisados"].append(n)
     estado["avatares_fracos_avisados"] = [n for n in estado["avatares_fracos_avisados"] if n in estado["avatares_fracos"]]
     for c, f in estado["fracas"].items():
         nome = f" ({f['criativo']})" if f["criativo"] else ""
         if c not in estado["fracas_avisadas"] and _enviar_aviso(
                 f"🪦 **A {c}{nome} não funcionou**: {f['videos']} vídeos somando as Páginas e nenhum bom "
-                f"(o melhor fez {_num(f['melhor'])} views). Os vídeos novos dela aparecem com aviso no painel."):
+                f"(o melhor fez {_num(f['melhor'])} views). **Não use mais essa copy nos vídeos novos.** "
+                "Os vídeos que já existem com ela aparecem com aviso no painel.", funcionario=True):
             estado["fracas_avisadas"].append(c)
     estado["fracas_avisadas"] = [c for c in estado["fracas_avisadas"] if c in estado["fracas"]]
     vistas = set()

@@ -423,6 +423,11 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
                 for campo in ("ultima_coleta", "ultima_tentativa", "resumo_dia", "relatorio_dia", "prioridade_dia",
                               "fracas", "fracas_avisadas", "avatares_fracos", "avatares_fracos_avisados", "restricao_avisada"):
                     if campo in radar_nuvem:
+                        if campo in ("resumo_dia", "relatorio_dia", "prioridade_dia"):
+                            # 14/11/2026: a data mais nova vence; a Nuvem não manda mais o relatório, e uma data velha
+                            # vinda dela faria o PC mandar de novo o que já mandou
+                            radar.estado[campo] = max(str(radar.estado.get(campo) or ""), str(radar_nuvem[campo] or "")) or None
+                            continue
                         radar.estado[campo] = radar_nuvem[campo]
                 radar._salvar()
                 mudou = True
