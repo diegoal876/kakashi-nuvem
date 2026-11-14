@@ -62,15 +62,18 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
     pags = [p for p in paginas(S, lang) if not p.get("pausada")]  # a paused Page gets nothing
     ids_lang = {pid for pid, p in S.get("paginas", {}).items() if idioma_de(p) == lang}
     dia = S.get("dias", {}).get(data)
+    manter: dict[str, list] = {}
     if dia:
         dia_pags = dia.get("paginas") or {}
-        fixadas = {pid: (e.get("avatares") or [])[:avatares_da_pagina(S["paginas"][pid])] for pid, e in dia_pags.items()
-                   if pid in ids_lang}
-        if fixadas:
-            return fixadas
+        # a paused Page gets nothing, even on a fixed day; a Page created after the day was fixed is included below,
+        # with avatars the fixed Pages are not using (as the Roleta's "Incluir páginas novas" does)
+        manter = {pid: (e.get("avatares") or [])[:avatares_da_pagina(S["paginas"][pid])] for pid, e in dia_pags.items()
+                  if pid in ids_lang and not S["paginas"][pid].get("pausada")}
+        if manter and all(p["id"] in manter for p in pags):
+            return manter
     k, of = _num_dia(data), _oficiais(S, lang)
     pool = [a for a in avatares(S, lang) if a.get("ativo") is not False and a["id"] not in of]
-    n, res, usados = len(pool), {}, set()
+    n, res, usados = len(pool), dict(manter), {a for avs in manter.values() for a in avs if a}
     ultimo: dict[str, dict[str, str]] = {}
     for d in S.get("dias", {}).values():
         if d.get("data", "") >= data:
@@ -84,6 +87,8 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
                     if a not in m or m[a] < d["data"]:
                         m[a] = d["data"]
     for pi, p in enumerate(sorted((x for x in pags if fase_efetiva(x) != 3), key=lambda x: x.get("prioridade") or 999)):
+        if p["id"] in res:
+            continue
         escolhidos = []
         eh_fase2 = fase_efetiva(p) == 2
         idades_boas = set(p.get("idades_boas") or []) if eh_fase2 else set()
@@ -104,7 +109,7 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
             escolhidos.append(melhor["id"] if melhor else None)
         res[p["id"]] = escolhidos
     for p in pags:
-        if fase_efetiva(p) == 3:
+        if fase_efetiva(p) == 3 and p["id"] not in res:
             o = p.get("avatarOficial")
             res[p["id"]] = [o if o in S.get("avatares", {}) else None]
     return res
