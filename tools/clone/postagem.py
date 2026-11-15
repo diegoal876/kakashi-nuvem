@@ -1984,7 +1984,9 @@ def _postar_devidos() -> None:
             path, legenda, info = VIDEOS / item["arquivo"], item["legenda"], item["info"]
             quando = item["quando"] if meta else None
             pagina = _pagina(dest.partition(":")[2])
-            atrasado = not meta and (item.get("quando") or agora) < agora - TRAVA_ATRASO_S
+            # A late video is checked on the Page before going out; a repost always is (since 15/11/2026): the same
+            # MP4 goes to the same Page more than once, and that is where the duplicates of 15/11 came from.
+            atrasado = (not meta and (item.get("quando") or agora) < agora - TRAVA_ATRASO_S) or bool(item.get("repost_de"))
             nome_item = item["nome"]
         if os.environ.get("GITHUB_ACTIONS") and not path.is_file():
             # 15/11/2026: two reposts reached the Nuvem without their MP4 and burnt 3 tries into "erro". The video is

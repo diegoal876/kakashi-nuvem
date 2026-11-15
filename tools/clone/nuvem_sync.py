@@ -70,7 +70,57 @@ def status_rclone_client() -> dict:
     return {"proprio": bool(cid), "client_id": (cid[:18] + "…") if len(cid) > 18 else cid}
 
 
-def configurar_rclone_client(client_id: str, client_secret: str) -> str:
+def _conf_com_client(txt: str, cid: str, csec: str, token: str) -> str:
+    """The [gdrive] section with the new client and the token that client issued; everything else stays."""
+    bloco = [f"client_id = {cid}", f"client_secret = {csec}", f"token = {token}"]
+    novas: list[str] = []
+    em_gdrive = inseriu = False
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if em_gdrive and not inseriu:
+                brancas = 0
+                while novas and not novas[-1].strip():
+                    novas.pop()
+                    brancas += 1
+                novas += bloco + [""] * brancas
+                inseriu = True
+            em_gdrive = s.lower() == "[gdrive]"
+        if em_gdrive and re.match(r"^\s*(client_id|client_secret|token)\s*=", ln):
+            continue
+        novas.append(ln)
+    if em_gdrive and not inseriu:
+        novas += bloco
+        inseriu = True
+    if not inseriu:
+        raise ValueError("A secao [gdrive] nao existe no rclone.conf.")
+    return "\n".join(novas) + "\n"
+
+
+def _autorizar_drive(cid: str, csec: str) -> str:
+    """Google login for the new client (a browser window opens on this PC); returns the token it issued."""
+    if not RCLONE_EXE.is_file():
+        raise ValueError(f"rclone nao encontrado em {RCLONE_EXE}.")
+    try:
+        r = subprocess.run([str(RCLONE_EXE), "authorize", "drive", cid, csec], capture_output=True, text=True,
+                           timeout=300, creationflags=postagem.NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise ValueError("O login do Google nao terminou em 5 min; nada foi trocado.") from None
+    m = re.search(r"--->\s*(\{.*?\})\s*<---", (r.stdout or "") + (r.stderr or ""), re.S)
+    if r.returncode != 0 or not m:
+        raise ValueError("O login do Google nao terminou (janela fechada ou acesso recusado); nada foi trocado.")
+    return m.group(1).strip()
+
+
+def _testar_conf(caminho: Path) -> bool:
+    return _rclone_cmd("--config", str(caminho), "lsf", "--max-depth", "1", GDRIVE_NUVEM, timeout=90)
+
+
+def configurar_rclone_client(client_id: str, client_secret: str, autorizar=None, testar=None) -> str:
+    """15/11/2026: this used to write only client_id/client_secret and keep the token issued for rclone's shared
+    client. Google refuses to refresh a token for another client, so about an hour later the PC and the Nuvem would
+    both lose the Drive. Now: Google login for the new client, a test listing with it, and only then the swap (the
+    old file is kept as rclone.conf.antes_client_proprio)."""
     cid = client_id.strip()
     csec = client_secret.strip()
     if not cid or not csec:
@@ -78,25 +128,20 @@ def configurar_rclone_client(client_id: str, client_secret: str) -> str:
     conf = _rclone_conf_path()
     if not conf.is_file():
         raise ValueError(f"Arquivo rclone.conf nao encontrado em {conf}.")
-    linhas = conf.read_text(encoding="utf-8", errors="replace").splitlines()
-    novas = []
-    em_gdrive = False
-    inseriu = False
-    for ln in linhas:
-        if ln.strip().startswith("[") and ln.strip().endswith("]"):
-            if em_gdrive and not inseriu:
-                novas.append(f"client_id = {cid}")
-                novas.append(f"client_secret = {csec}")
-                inseriu = True
-            em_gdrive = ln.strip().lower() == "[gdrive]"
-        if em_gdrive and re.match(r"^\s*client_(id|secret)\s*=", ln):
-            continue
-        novas.append(ln)
-    if em_gdrive and not inseriu:
-        novas.append(f"client_id = {cid}")
-        novas.append(f"client_secret = {csec}")
-    novo_txt = "\n".join(novas) + "\n"
-    conf.write_text(novo_txt, encoding="utf-8")
+    atual = conf.read_text(encoding="utf-8", errors="replace")
+    token = (autorizar or _autorizar_drive)(cid, csec)
+    novo_txt = _conf_com_client(atual, cid, csec, token)
+    teste = conf.with_name("rclone.conf.teste")
+    teste.write_text(novo_txt, encoding="utf-8")
+    try:
+        ok = bool((testar or _testar_conf)(teste))
+    except Exception:
+        ok = False
+    if not ok:
+        teste.unlink(missing_ok=True)
+        raise ValueError("A chave nova nao conseguiu ler o Drive; nada foi trocado (o rclone segue com a chave antiga).")
+    shutil.copy2(conf, conf.with_name("rclone.conf.antes_client_proprio"))
+    teste.replace(conf)
     gh_ok = False
     if GH_EXE.is_file():
         try:
