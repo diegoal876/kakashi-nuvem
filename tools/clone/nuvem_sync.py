@@ -363,8 +363,20 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
     if not nuvem_em or nuvem_em <= ultimo_imp:
         return False, True
 
-    _rclone_cmd("copy", GDRIVE_NUVEM, str(nuvem), "--max-depth", "1", "--include",
-                "{fila,fila_nuvem,contas,roleta,radar}.json", timeout=30)
+    # 15/11/2026: one 30 s copy of fila + fila_nuvem + radar (4 MB) timed out, the old fila_nuvem.json left on the PC
+    # was read as the Nuvem's work and marked imported: 24 posts went unseen and 10 cancelled reposts came back.
+    # The Nuvem's queue now comes down alone and nothing counts as imported without it. One try per sync (the next
+    # sync, 25 s later, tries again): this runs before the heartbeat goes up, so long retries here could leave the
+    # PC silent for 5 min and let the Nuvem post the same queue.
+    if RCLONE_EXE.is_file():
+        if not _rclone_cmd("copyto", f"{GDRIVE_NUVEM}/fila_nuvem.json", str(nuvem / "fila_nuvem.json"), timeout=120):
+            if not _estado_sync.get("avisou_fila_nuvem"):
+                postagem._log("Nuvem: nao consegui baixar a fila da Nuvem; tento de novo na proxima sincronizacao.")
+                _estado_sync["avisou_fila_nuvem"] = True
+            return False, True
+        _estado_sync["avisou_fila_nuvem"] = False
+        _rclone_cmd("copy", GDRIVE_NUVEM, str(nuvem), "--max-depth", "1", "--include",
+                    "{contas,roleta,radar}.json", timeout=90)
 
     mudou = False
     # fila_nuvem.json is written only by GitHub Actions, so nothing on the PC side can have overwritten it;
@@ -389,6 +401,8 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
                     if item_n.get("quando") and item_n.get("quando") > (loc.get("quando") or 0) and loc.get("status") == "agendado":
                         loc["quando"] = item_n["quando"]
                         mudou = True
+                elif item_n.get("arquivo") and item_n["arquivo"] in (postagem.fila.get("lixeira_em") or {}):
+                    continue  # the PC took it out of the queue on purpose; an older copy from the Nuvem never brings it back
                 else:
                     v_src = nuvem / "videos" / item_n.get("arquivo", "")
                     v_dst = postagem.VIDEOS / item_n.get("arquivo", "")
