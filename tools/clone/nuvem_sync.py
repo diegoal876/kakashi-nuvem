@@ -373,7 +373,9 @@ def importar_da_nuvem(exigir_rede: bool = False) -> tuple[bool, bool]:
             if not _estado_sync.get("avisou_fila_nuvem"):
                 postagem._log("Nuvem: nao consegui baixar a fila da Nuvem; tento de novo na proxima sincronizacao.")
                 _estado_sync["avisou_fila_nuvem"] = True
-            return False, True
+            # rede_ok False: the heartbeat still goes up, but checou_nuvem stays off, so on startup the PC keeps
+            # waiting (up to 15 min) instead of posting "overdue" videos the Nuvem may already have posted
+            return False, False
         _estado_sync["avisou_fila_nuvem"] = False
         _rclone_cmd("copy", GDRIVE_NUVEM, str(nuvem), "--max-depth", "1", "--include",
                     "{contas,roleta,radar}.json", timeout=90)

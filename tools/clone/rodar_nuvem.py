@@ -61,6 +61,7 @@ def _recarregar_fila_da_nuvem() -> None:
             postagem.fila.update(novo)
             for item in postagem.fila.get("itens", []):
                 item["andamento"] = ""
+                item.pop("so_pc", None)  # each round looks for the MP4 again: it may have reached the Drive since
 
 
 def _tem_devidos_agora() -> bool:
@@ -83,8 +84,8 @@ def _proximo_vencimento() -> float | None:
     with postagem.lock:
         caidas = set((postagem.fila.get("tokens_caidos") or {}).get("ids", []))
         for item in postagem.fila.get("itens", []):
-            if item.get("status") != "agendado":
-                continue
+            if item.get("status") != "agendado" or item.get("so_pc"):
+                continue  # so_pc: its MP4 is not here, the PC posts it; waiting for it would hold the Sentinel
             rest = [d for d in postagem._restantes(item) if d.partition(":")[2] not in caidas]
             if rest:
                 q = item.get("quando") or agora

@@ -1668,6 +1668,8 @@ def _restantes(item: dict) -> list[str]:
 
 def _devidos(item: dict, agora: float) -> list[tuple[str, bool]]:
     """(destination, scheduled at Meta?) that should be sent now."""
+    if item.get("so_pc") and os.environ.get("GITHUB_ACTIONS"):
+        return []  # its video never reached the Nuvem: the PC posts it (rodar_nuvem clears the mark each round)
     out, q = [], item.get("quando")
     sem_sched = set(fila["config"].get("sem_agendamento_meta") or [])
     for d in _restantes(item):
@@ -1923,6 +1925,12 @@ def _ja_na_meta(iid: int, dest: str, pagina: dict) -> dict | None:
         conhecidos = {r.get("id") for i in fila["itens"] for r in i.get("resultados", {}).values() if r.get("id")}
         if item.get("repost_de") and (rep := _rep()):
             conhecidos |= rep.ids_do_mp4(item["repost_de"])
+        # 15/11/2026: a cancelled repost (14/11 06:09) took the 02:09 Reel of another item of the same Page and the
+        # same length (01:25), which then went out twice. A video belongs to the waiting item whose time is closest.
+        meu_q = int(item.get("quando") or desde)
+        rivais = [(int(i.get("quando") or 0), float((i.get("info") or {}).get("dur") or 0)) for i in fila["itens"]
+                  if i is not item and i.get("status") in ("agendado", "erro") and dest in i.get("destinos", [])
+                  and (i.get("resultados", {}).get(dest) or {}).get("estado") != "ok"]
     if not dur:
         return None
     try:
@@ -1934,11 +1942,14 @@ def _ja_na_meta(iid: int, dest: str, pagina: dict) -> dict | None:
     for v in dados.get("data", []):
         if not v.get("id") or v["id"] in conhecidos:
             continue
-        if abs(float(v.get("length") or 0) - dur) <= TRAVA_TOLERANCIA_S:
+        tam = float(v.get("length") or 0)
+        if abs(tam - dur) <= TRAVA_TOLERANCIA_S:
             try:
                 em = int(datetime.strptime(v["created_time"], "%Y-%m-%dT%H:%M:%S%z").timestamp())
             except (KeyError, ValueError):
                 em = int(time.time())
+            if any(q and abs(tam - d) <= TRAVA_TOLERANCIA_S and abs(em - q) < abs(em - meu_q) for q, d in rivais):
+                continue
             return {"id": v["id"], "tipo": "reels", "link": f"https://www.facebook.com/reel/{v['id']}/",
                     "estado": "ok", "em": em, "conf": "ok", "trava": True}
     return None
@@ -1975,6 +1986,16 @@ def _postar_devidos() -> None:
             pagina = _pagina(dest.partition(":")[2])
             atrasado = not meta and (item.get("quando") or agora) < agora - TRAVA_ATRASO_S
             nome_item = item["nome"]
+        if os.environ.get("GITHUB_ACTIONS") and not path.is_file():
+            # 15/11/2026: two reposts reached the Nuvem without their MP4 and burnt 3 tries into "erro". The video is
+            # on the PC: leave it scheduled for the PC instead of failing it here.
+            with lock:
+                if item := _item(iid):
+                    item["andamento"] = ""
+                    item["so_pc"] = True
+                    _salvar()
+            _log(f"Arquivo nao chegou a Nuvem; fica para o PC postar quando voltar · {_nome_destino(dest)} · {nome_item}")
+            continue
         if atrasado and pagina and (achado := _ja_na_meta(iid, dest, pagina)):
             with lock:
                 if item := _item(iid):
