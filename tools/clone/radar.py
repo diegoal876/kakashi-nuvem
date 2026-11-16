@@ -38,6 +38,7 @@ import urllib.error
 import urllib.request
 import wave
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
 from math import ceil
@@ -65,6 +66,8 @@ FORA_LISTA_H = 3            # can take off on its third or fourth day: younger o
 FORA_LISTA_VELHO_H = 24     # this long, and up to CONGELADO_DIAS old after this
 NOVA_VIEWS = 10000          # a Page still without its normal (min_posts videos with 24h) warns from this many views
 PAUSA_S = 0.2               # between calls to Meta
+MEDIANA_MIN = 100           # 15/11/2026: abaixo disso a Página quase não tem entrega; o × usa esse piso (ver _divisor)
+COLETA_PARALELO = 3         # 15/11/2026: Páginas lidas ao mesmo tempo na coleta (o limite da Meta é por Página)
 CEDO_MIN_H = 1              # a video younger than this says nothing yet
 CEDO_LIMITE = 3             # times the expected views at that age
 CEDO_AMOSTRA = 5            # older videos with a reading near that age, or the plain median is used
@@ -473,7 +476,8 @@ def _coletar_tentando(p: dict, agora: int) -> int:
 def coletar() -> str:
     """Reads every Page, then warns. Stops at once when Meta cut the app off or a permission is missing: the next
     Pages would only get the same answer. A dropped connection is retried, and only REDE_SEGUIDAS Pages in a row
-    without connection stop it (15/11/2026)."""
+    without connection stop it (15/11/2026). COLETA_PARALELO Pages are read at the same time (Meta's limit is per
+    Page), and estado["progresso"] tells the tab how far it went."""
     if not _coleta.acquire(blocking=False):
         raise Recusa("A coleta ja esta rodando.")
     try:
@@ -483,37 +487,60 @@ def coletar() -> str:
             estado["erro"], estado["faltam"] = "", []
             _salvar()
         if postagem.fila.get("bloqueio"):
-            estado["erro"] = "A Meta esta com o app bloqueado: a coleta espera liberar."
+            estado["erro"] = "A Meta esta com o app bloqueado: a coleta espera."
             _salvar()
             return estado["erro"]
         registrar()
-        lidos, sem_rede, seguidas = 0, [], 0
-        for p in postagem.contas().get("paginas", []):
-            if not p.get("token"):
-                continue
+        paginas = [p for p in postagem.contas().get("paginas", []) if p.get("token")]
+        st = {"lidos": 0, "sem_rede": [], "seguidas": 0, "feitas": 0, "lendo": []}
+        parar = threading.Event()
+        trava = threading.Lock()
+        estado["progresso"] = {"feitas": 0, "total": len(paginas), "lendo": [], "desde": agora}
+
+        def uma(p: dict) -> None:
+            if parar.is_set():
+                return
+            nome = p.get("nome") or p["id"]
+            with trava:
+                st["lendo"].append(nome)
+                estado["progresso"]["lendo"] = list(st["lendo"])
             try:
-                lidos += _coletar_tentando(p, agora)
-                seguidas = 0
+                n = _coletar_tentando(p, agora)
+                with trava:
+                    st["lidos"] += n
+                    st["seguidas"] = 0
             except GraphError as e:
-                if e.bloqueio:
-                    estado["erro"] = f"Coleta interrompida: {e}"
-                    return _fechar(lidos)
-                if e.code == "rede":
-                    sem_rede.append(p.get("nome") or p["id"])
-                    seguidas += 1
-                    if seguidas >= REDE_SEGUIDAS:
-                        estado["erro"] = f"Coleta interrompida: {e} ({seguidas} Páginas seguidas sem conexão)"
-                        return _fechar(lidos)
-                    continue
-                if _falta_permissao(e):
-                    estado["faltam"].append("read_insights")
-                    return _fechar(lidos)
-                estado["erro"] = f"{p['nome']}: {e}"
-        if sem_rede and not estado["erro"]:
-            estado["erro"] = (f"Sem conexão com a Meta em {len(sem_rede)} Página(s), mesmo tentando 3 vezes; "
-                              f"elas entram na próxima coleta: {', '.join(sem_rede[:6])}")
-        return _fechar(lidos)
+                with trava:
+                    if e.bloqueio:
+                        estado["erro"] = f"Coleta interrompida: {e}"
+                        parar.set()
+                    elif e.code == "rede":
+                        st["sem_rede"].append(nome)
+                        st["seguidas"] += 1
+                        if st["seguidas"] >= REDE_SEGUIDAS:
+                            estado["erro"] = f"Coleta interrompida: {e} ({st['seguidas']} Páginas seguidas sem conexão)"
+                            parar.set()
+                    elif _falta_permissao(e):
+                        if "read_insights" not in estado["faltam"]:
+                            estado["faltam"].append("read_insights")
+                        parar.set()
+                    else:
+                        estado["erro"] = f"{p['nome']}: {e}"
+            finally:
+                with trava:
+                    if nome in st["lendo"]:
+                        st["lendo"].remove(nome)
+                    st["feitas"] += 1
+                    estado["progresso"].update(feitas=st["feitas"], lendo=list(st["lendo"]))
+
+        with ThreadPoolExecutor(max_workers=max(1, COLETA_PARALELO), thread_name_prefix="radar-coleta") as ex:
+            list(ex.map(uma, paginas))
+        if st["sem_rede"] and not estado["erro"]:
+            estado["erro"] = (f"Sem conexão com a Meta em {len(st['sem_rede'])} Página(s), mesmo tentando 3 vezes; "
+                              f"elas entram na próxima coleta: {', '.join(st['sem_rede'][:6])}")
+        return _fechar(st["lidos"])
     finally:
+        estado.pop("progresso", None)
         _coleta.release()
 
 
@@ -540,6 +567,15 @@ def _eng(p: dict) -> float | None:
         return None
     tem = [m for m in PESOS if p.get(m) is not None]
     return sum(PESOS[m] * p[m] for m in tem) / p["views"] if tem else None
+
+
+def _divisor(views, base) -> float:
+    """A base do ×. Numa Página quase sem entrega (mediana de 80 views) qualquer vídeo virava centenas de vezes o
+    normal (Natalia Santos com 1.130×, Janaina P com 4.789× contra "0 esperadas"). Até a base, nada muda; acima dela, o
+    vídeo é comparado com pelo menos MEDIANA_MIN views: 90 views numa Página de 18 dão 1×, e 5 mil dão 50×.
+    Assim o placar de avatar e copy fracos (vídeos abaixo do normal) fica igual."""
+    base = max(base or 1, 1)
+    return max(base, min(views or 0, MEDIANA_MIN))
 
 
 def _vezes(valor, base) -> float | None:
@@ -586,7 +622,22 @@ def _faixa_horario(ts: int) -> str:
     return "18h–23h (Noite)"
 
 
+_cache_idiomas: dict = {}
+
+
 def _idiomas_dest() -> dict[str, str]:
+    """Página da Meta -> idioma. Cache de 1 min (15/11/2026): casar as Páginas da Roleta com as da Meta é caro, e a aba
+    Virais e as sugestões de copies chamavam isto dezenas de vezes por atualização (a aba chegou a levar 36 s)."""
+    chave = int(time.time()) // 60
+    if chave in _cache_idiomas:
+        return dict(_cache_idiomas[chave])
+    out = _idiomas_dest_agora()
+    _cache_idiomas.clear()
+    _cache_idiomas[chave] = out
+    return dict(out)
+
+
+def _idiomas_dest_agora() -> dict[str, str]:
     out = {f"fb:{c['id']}": postagem._idioma(c.get("idioma")) for c in postagem.contas().get("paginas", [])}
     S = postagem.roleta_dados() or {}
     if S:
@@ -609,9 +660,10 @@ def analisar(posts: dict, cfg: dict, agora: int) -> tuple[list[dict], list[dict]
         comp = [p["shares"] / p["views"] for p in maduros if p.get("shares") is not None and p["views"]]
         base_eng, base_comp = median(taxas) if taxas else None, median(comp) if comp else None
         contas.append({"dest": dest, "pagina": lista[0]["pagina"], "idioma": lang_d, "amostra": len(maduros),
-                       "mediana": base, "pronta": len(maduros) >= cfg["min_posts"]})
+                       "mediana": base, "pronta": len(maduros) >= cfg["min_posts"],
+                       "sem_entrega": bool(base) and base < MEDIANA_MIN and len(maduros) >= cfg["min_posts"]})
         for n, p in enumerate(todos):
-            score = round(p["views"] / max(base or 1, 1), 1)
+            score = round(p["views"] / _divisor(p["views"], base), 1)
             faixa, motivo = None, ""
             if len(maduros) < cfg["min_posts"]:
                 motivo = "poucos dados"
@@ -865,6 +917,60 @@ def ranking_copies(linhas: list[dict], cfg: dict, fracas: dict) -> list[dict]:
     return sorted(out, key=lambda r: (-r["campeoes"], -r["bons"], -r["score_bayes"]))
 
 
+_cache_placar: dict = {}
+
+
+def placar_copies(idioma: str | None = None) -> dict[str, dict]:
+    """copy -> a linha dela no ranking das copies (campeões, bons, bayes, status), de um idioma. Cache de 2 min."""
+    lang = idioma if idioma in ("en", "es") else None
+    chave = (lang, int(time.time()) // 120)
+    if chave in _cache_placar:
+        return _cache_placar[chave]
+    agora = int(time.time())
+    idiomas_d = _idiomas_dest()
+    with lock:
+        posts = {k: p for k, p in estado["posts"].items() if not lang or idiomas_d.get(p.get("dest"), "en") == lang}
+        cfg = estado["config"]
+        linhas = analisar(posts, cfg, agora)[0]
+    res = {r["chave"]: r for r in ranking_copies(linhas, cfg, copias_fracas(linhas, cfg))}
+    _cache_placar.clear()
+    _cache_placar[chave] = res
+    return res
+
+
+SUGERIDAS_CACHE_S = 120
+_sugeridas: dict = {}          # idioma -> (quando, resultado)
+_sugeridas_rodando: set = set()
+
+
+def _calcular_sugeridas(idioma: str | None, placar: dict) -> dict:
+    try:
+        import repostagem
+        data = (datetime.now().date() + timedelta(days=1)).isoformat()
+        rel = repostagem.pedido_relatorio(data, idioma, placar=placar)
+    except Exception as e:
+        return {"data": None, "linhas": [], "erro": str(e)}
+    return {"data": rel["data"], "travado": rel["travado"], "linhas": rel["linhas"]}
+
+
+def copies_sugeridas(idioma: str | None, placar: dict) -> dict:
+    """Para cada Página do pedido de amanhã, as melhores copies que ela ainda não postou (Repostagem.sugerir_copies).
+    O cálculo leva vários segundos, então roda em segundo plano a cada SUGERIDAS_CACHE_S: a aba recebe o último pronto
+    e nunca espera por ele (antes, cada atualização da aba de 5 em 5 s refazia tudo)."""
+    chave = idioma or "todos"
+    quando, res = _sugeridas.get(chave, (0, None))
+    if time.time() - quando >= SUGERIDAS_CACHE_S and chave not in _sugeridas_rodando:
+        _sugeridas_rodando.add(chave)
+
+        def rodar() -> None:
+            try:
+                _sugeridas[chave] = (time.time(), _calcular_sugeridas(idioma, placar))
+            finally:
+                _sugeridas_rodando.discard(chave)
+        threading.Thread(target=rodar, daemon=True, name="radar-sugeridas").start()
+    return res if res is not None else {"data": None, "linhas": [], "calculando": True}
+
+
 def avatares_na_roleta(S: dict | None, idioma: str = "en") -> dict[str, dict]:
     """Número do avatar -> se está ativo na Roleta e em que Página cai hoje e amanhã (1 avatar por Página)."""
     if not S:
@@ -904,11 +1010,47 @@ def _views_na_idade(p: dict, horas: float) -> float | None:
     return float(v0) if t1 == t0 else v0 + (v1 - v0) * (alvo - t0) / (t1 - t0)
 
 
-def subindo(posts: dict, cfg: dict, agora: int) -> list[dict]:
+def _com_vigia(posts: dict, agora: int) -> tuple[dict, dict]:
+    """Os posts com a leitura mais nova do vigia rápido (a cada 10 min) no lugar da última coleta, mais os reels que o
+    vigia já viu e a coleta ainda não (postados depois dela). Devolve (posts, ganho na última hora por reel)."""
+    rapido, meta = estado.get("rapido") or {}, estado.get("rapido_meta") or {}
+    try:
+        import vigia
+        ganho_1h = vigia.ganho_1h
+    except Exception:  # a Nuvem não tem o vigia
+        return posts, {}
+    out, ganhos = dict(posts), {}
+    for k, leituras in rapido.items():
+        if not leituras:
+            continue
+        t, v = leituras[-1][0], leituras[-1][1]
+        p = out.get(k)
+        if p is None:
+            m = meta.get(k)
+            if not m or agora - m["criado"] >= MADURO_H * 3600:
+                continue
+            p = {"dest": m["dest"], "pagina": m.get("pagina", ""), "criado": m["criado"], "link": m.get("link", ""),
+                 "views": v, "plays_total": leituras[-1][2] if len(leituras[-1]) > 2 else None, "lido": t, "so_vigia": True}
+        elif t > (p.get("lido") or 0) and v is not None and v >= (p.get("views") or 0):
+            p = {**p, "views": v, "lido": t, **({"plays_total": leituras[-1][2]} if len(leituras[-1]) > 2 and leituras[-1][2] else {})}
+        else:
+            p = {**p}
+        out[k] = p
+        if (g := ganho_1h(leituras, p["criado"])) is not None:
+            ganhos[k] = round(g)
+    return out, ganhos
+
+
+def subindo(posts: dict, cfg: dict, agora: int, vigia_rapido: bool = False) -> list[dict]:
     """Videos younger than MADURO_H already running ahead of the account. Uses age-interpolated readings when available,
-    or a realistic early-maturity curve (25%..100% of 24h median) so early breakouts at 2h-6h are detected accurately."""
+    or a realistic early-maturity curve (25%..100% of 24h median) so early breakouts at 2h-6h are detected accurately.
+    vigia_rapido (só a aba, nunca os avisos): usa as leituras do vigia de 10 em 10 min e mostra o ganho da última hora."""
     out = []
     idiomas_d = _idiomas_dest()
+    ganhos, avisados = {}, {}
+    if vigia_rapido:
+        posts, ganhos = _com_vigia(posts, agora)
+        avisados = (estado.get("vigia") or {}).get("avisados") or {}
     for dest, lista in _grupos(posts).items():
         maduros = _maduros(lista, agora)
         if len(maduros[:MAX_POSTS]) < cfg["min_posts"]:
@@ -922,7 +1064,7 @@ def subindo(posts: dict, cfg: dict, agora: int) -> list[dict]:
             por_idade = len(na_idade) >= CEDO_AMOSTRA
             fator_curva = min(1.0, 0.25 + 0.75 * (horas / MADURO_H))
             base = median(na_idade) if por_idade else max(final * fator_curva, 100.0)
-            vezes = round(p["views"] / max(base, 1), 1)
+            vezes = round(p["views"] / _divisor(p["views"], base), 1)
             plays_t = p.get("plays_total") or 0
             replay_x = round(plays_t / p["views"], 2) if plays_t and p["views"] and plays_t >= p["views"] else None
             comm_v = p.get("comments") or 0
@@ -933,6 +1075,8 @@ def subindo(posts: dict, cfg: dict, agora: int) -> list[dict]:
                             "esperado": round(base), "vezes": vezes, "horas": int(horas), "por_idade": por_idade,
                             "avatar": p.get("avatar"), "formato": p.get("formato"), "criado": p["criado"],
                             "capa": p.get("capa"), "repost": p.get("formato") in REPOSTS,
+                            "lido": p.get("lido"), "ganho_1h": ganhos.get(p["key"]), "vigia": p["key"] in avisados,
+                            "so_vigia": bool(p.get("so_vigia")),
                             "criativo": _nome_formato(cfg, p.get("formato"))})
     return sorted(out, key=lambda x: (x["vezes"], x.get("comments") or 0), reverse=True)
 
@@ -2160,7 +2304,9 @@ def publico(idioma: str | None = None) -> dict:
                                                   "queda_videos", "queda_pct", "auto_fase2_h", "fase2_comentarios",
                                                   "fase3_comentarios", "fase2_amostra", "fase3_bons_pagina")},
                            "horarios_coleta": cfg["horarios_coleta"]},
-                "subindo": subindo(posts_src, cfg, agora), "avatares": ranking(linhas, "avatar"), "formatos": formatos,
+                "subindo": subindo(posts_src, cfg, agora, vigia_rapido=True), "avatares": ranking(linhas, "avatar"), "formatos": formatos,
+                "progresso": dict(estado["progresso"]) if estado.get("progresso") else None,
+                "vigia_em": (estado.get("vigia") or {}).get("em"),
                 "sugestoes": prontas, "observacao": observa, "sem_registro": sem_registro(linhas, cfg),
                 "fracas": copias_fracas(linhas, cfg) if lang_f else estado["fracas"],
                 "criativos_globais": criativos_globais(linhas, cfg),
@@ -2190,6 +2336,7 @@ def publico(idioma: str | None = None) -> dict:
     # 15/11/2026: fora do lock do radar, porque leem o repostagem.json (com o lock da Repostagem)
     res["ranking_paginas"] = ranking_paginas(contas, agora)
     res["copies_rank"] = ranking_copies(linhas, cfg, res["fracas"])
+    res["copies_sugeridas"] = copies_sugeridas(lang_f, {r["chave"]: r for r in res["copies_rank"]})
     na_roleta = avatares_na_roleta(S_view, lang_f or "en")
     camp_av = campeoes_por("avatar", {c["dest"] for c in contas})
     for r in res["avatares"]:
