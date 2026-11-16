@@ -26,6 +26,7 @@ avatar in the tab; a correction is never overwritten.
 Files in output/postagem/: radar.json (videos, settings and the Discord webhook; the webhook never goes to the page)
 and radar_capas/ (one cover per video: Meta's links expire, so they are kept here).
 """
+import http.client
 import json
 import re
 import shutil
@@ -444,9 +445,35 @@ def _reler_fora_da_lista(p: dict, listados: set, agora: int) -> int:
     return n
 
 
+REDE_ESPERAS = (5, 15)  # 15/11/2026: segundos antes da 2ª e da 3ª tentativa de uma Página quando a Meta derruba a conexão
+REDE_SEGUIDAS = 3       # Páginas seguidas sem conexão mesmo depois das tentativas: a internet caiu e a coleta para
+
+
+def _coletar_tentando(p: dict, agora: int) -> int:
+    """Uma Página, tentando de novo quando a conexão cai no meio (WinError 10054, a Meta fechou a conexão): um corte
+    de um instante parava a coleta inteira e deixava as Páginas seguintes sem leitura até a próxima coleta."""
+    for espera in (*REDE_ESPERAS, None):
+        try:
+            return _coletar_conta(p, agora)
+        except (http.client.HTTPException, ConnectionError) as e:
+            # a Meta fechou a conexão no meio da resposta ("Remote end closed connection without response"): o
+            # postagem._http não traduz isso, e escapava como erro solto que derrubava a coleta inteira. Aqui é só
+            # leitura, então tentar de novo é seguro.
+            erro = GraphError(f"sem conexao com a Meta: {e}", "rede")
+        except GraphError as e:
+            if e.code != "rede" or e.bloqueio:
+                raise
+            erro = e
+        if espera is None:
+            raise erro
+        time.sleep(espera)
+    return 0
+
+
 def coletar() -> str:
     """Reads every Page, then warns. Stops at once when Meta cut the app off or a permission is missing: the next
-    Pages would only get the same answer."""
+    Pages would only get the same answer. A dropped connection is retried, and only REDE_SEGUIDAS Pages in a row
+    without connection stop it (15/11/2026)."""
     if not _coleta.acquire(blocking=False):
         raise Recusa("A coleta ja esta rodando.")
     try:
@@ -460,20 +487,31 @@ def coletar() -> str:
             _salvar()
             return estado["erro"]
         registrar()
-        lidos = 0
+        lidos, sem_rede, seguidas = 0, [], 0
         for p in postagem.contas().get("paginas", []):
             if not p.get("token"):
                 continue
             try:
-                lidos += _coletar_conta(p, agora)
+                lidos += _coletar_tentando(p, agora)
+                seguidas = 0
             except GraphError as e:
-                if e.bloqueio or e.code == "rede":
+                if e.bloqueio:
                     estado["erro"] = f"Coleta interrompida: {e}"
                     return _fechar(lidos)
+                if e.code == "rede":
+                    sem_rede.append(p.get("nome") or p["id"])
+                    seguidas += 1
+                    if seguidas >= REDE_SEGUIDAS:
+                        estado["erro"] = f"Coleta interrompida: {e} ({seguidas} Páginas seguidas sem conexão)"
+                        return _fechar(lidos)
+                    continue
                 if _falta_permissao(e):
                     estado["faltam"].append("read_insights")
                     return _fechar(lidos)
                 estado["erro"] = f"{p['nome']}: {e}"
+        if sem_rede and not estado["erro"]:
+            estado["erro"] = (f"Sem conexão com a Meta em {len(sem_rede)} Página(s), mesmo tentando 3 vezes; "
+                              f"elas entram na próxima coleta: {', '.join(sem_rede[:6])}")
         return _fechar(lidos)
     finally:
         _coleta.release()
@@ -660,6 +698,7 @@ def ranking(linhas: list[dict], campo: str) -> list[dict]:
             continue  # Unidentified raw copy numbers wait for analysis instead of polluting creative rankings
         grupos.setdefault(val, []).append(a)
     out = []
+    bom = _bom(estado.get("config") or {})
     for chave, lista in grupos.items():
         n_vids = len(lista)
         outliers = sum(1 for a in lista if a["faixa"] in AVISO)
@@ -678,6 +717,8 @@ def ranking(linhas: list[dict], campo: str) -> list[dict]:
         comm_vid = round(total_comm / n_vids, 1)
         diag = _diagnostico_grupo(score_med, retem6, fim, comm_vid, taxa) if n_vids >= 3 else ""
         out.append({"chave": chave, "videos": n_vids, "outliers": outliers, "taxa": taxa,
+                    "views_total": sum(a["views"] or 0 for a in lista), "views_melhor": max(a["views"] or 0 for a in lista),
+                    "paginas": len({a["dest"] for a in lista}), "bons": sum(1 for a in lista if bom(a)),
                     "copies": sorted({a["formato"] for a in lista if a.get("formato")}),
                     "retem6": retem6, "fim": fim, "queda_s": queda_s, "queda_pct": queda_pct, "replay_x": replay_x,
                     "score": score_med, "score_copy": score_copy_med, "score_bayes": score_bayes,
@@ -708,6 +749,146 @@ def conselhos(linhas: list[dict]) -> list[dict]:
                         "ganchos": ranking(lista, "gancho"), "avatares": ranking(lista, "avatar")[:5],
                         "horarios": ranking(lista, "faixa_horario")})
     return sorted(out, key=lambda c: c["pagina"].lower())
+
+
+# ─── Aba Virais na Repostagem (15/11/2026) ───────────────
+# Campeão e outlier vêm da Repostagem (repostagem.json), que é quem decide os reposts: assim a aba aponta os mesmos
+# vídeos que vão para as vagas. O radar só soma as views e a capa de cada um.
+CAMPEAO_ROTULO = {"confirmado": "confirmado", "confirmar": "confirmando", "destaque": "destacou", "cansado": "cansou"}
+CAMPEAO_ORDEM = {"confirmado": 0, "confirmar": 1, "destaque": 2, "cansado": 3}
+_cache_paginas: dict = {}
+
+
+def _mp4s_repostagem() -> dict:
+    try:
+        import repostagem
+    except Exception:
+        return {}
+    with repostagem.lock:
+        return {k: dict(m) for k, m in (repostagem.estado.get("mp4s") or {}).items()}
+
+
+def _item_mp4(k: str, m: dict, posts: dict) -> dict:
+    """Um campeão ou outlier com as views de agora: o remix mostra o primeiro post dele."""
+    orig = next((r.get("key") for r in m.get("posts", []) if r.get("key")), None) if m.get("tipo") == "remix" else k
+    post = posts.get(orig or "") or {}
+    return {"key": orig or k, "copy": m.get("copy") or post.get("formato"), "avatar": m.get("avatar") or post.get("avatar"),
+            "x": m.get("x0"), "views": post.get("views"), "comments": post.get("comments"), "capa": post.get("capa"),
+            "link": post.get("link"), "criado": post.get("criado"), "remix": m.get("tipo") == "remix",
+            "reposts": sum(1 for r in m.get("posts", []) if r.get("tipo") == "repost"), "sinais": m.get("sinais") or []}
+
+
+def ranking_paginas(contas: list[dict], agora: int) -> dict:
+    """Destaques por Página: as que têm campeão ou outlier, da melhor para a pior. Campeão = destacou pelo corte de bom
+    (destaque, confirmando, confirmado; o que cansou aparece no fim). Outlier = 3× ou mais sem chegar a bom: na fila da
+    segunda chance, com o repost marcado ou já feito. Ordem: campeões ativos, confirmados, outliers, maior vídeo."""
+    chave = (tuple(sorted(c["dest"] for c in contas)), agora // 60)
+    if chave in _cache_paginas:
+        return _cache_paginas[chave]
+    try:
+        import repostagem
+        S = repostagem._roleta()
+        rid_de = {f"fb:{pid}": (rid, p) for rid, p, pid in repostagem.paginas(S, pausadas=True)}
+        reposts = repostagem._keys_reposts()
+    except Exception:
+        repostagem, rid_de, reposts = None, {}, set()
+    with lock:
+        posts = dict(estado["posts"])
+    por_rid: dict[str, list] = {}
+    for k, m in _mp4s_repostagem().items():
+        por_rid.setdefault(m.get("rid"), []).append((k, m))
+    out, sem = [], 0
+    for c in contas:
+        rid, pg = rid_de.get(c["dest"], (None, {}))
+        camp, outl, vistos = [], [], set()
+        for k, m in por_rid.get(rid, []) if rid else []:
+            item = _item_mp4(k, m, posts)
+            if m["estado"] in CAMPEAO_ROTULO:
+                camp.append({**item, "estado": m["estado"], "rotulo": CAMPEAO_ROTULO[m["estado"]]})
+            elif m["estado"] in ("segunda", "feito"):
+                rot = "repost marcado" if m["estado"] == "segunda" else "segunda chance feita"
+                outl.append({**item, "estado": m["estado"], "rotulo": rot})
+            else:
+                continue
+            vistos.add(k)
+        if rid and repostagem:
+            try:
+                fila = repostagem.segunda_chance(rid, agora, posts, reposts)
+            except Exception:
+                fila = []
+            for s in fila:
+                if s["key"] in vistos:
+                    continue
+                post = posts.get(s["key"]) or {}
+                outl.append({"key": s["key"], "copy": s.get("copy"), "avatar": s.get("avatar"), "x": s.get("x"),
+                             "views": post.get("views"), "comments": post.get("comments"), "capa": post.get("capa"),
+                             "link": post.get("link"), "criado": post.get("criado"), "remix": False, "reposts": 0,
+                             "sinais": [], "estado": "fila", "rotulo": "na fila da segunda chance"})
+        if not camp and not outl:
+            sem += 1
+            continue
+        camp.sort(key=lambda x: (CAMPEAO_ORDEM[x["estado"]], -(x["x"] or 0)))
+        outl.sort(key=lambda x: ({"fila": 0, "segunda": 1, "feito": 2}[x["estado"]], -(x["x"] or 0)))
+        ativos = [x for x in camp if x["estado"] != "cansado"]
+        out.append({"dest": c["dest"], "pagina": c["pagina"].strip(), "rid": rid, "pausada": bool(pg.get("pausada")),
+                    "mediana": c["mediana"], "amostra": c["amostra"], "campeoes": camp, "outliers": outl,
+                    "ativos": len(ativos), "confirmados": sum(1 for x in camp if x["estado"] == "confirmado"),
+                    "melhor_views": max((x["views"] or 0 for x in camp + outl), default=0)})
+    out.sort(key=lambda r: (-r["ativos"], -r["confirmados"], -len(r["outliers"]), -r["melhor_views"]))
+    res = {"paginas": out, "sem": sem}
+    _cache_paginas.clear()
+    _cache_paginas[chave] = res
+    return res
+
+
+def campeoes_por(campo: str, dests: set) -> Counter:
+    """Campeões ativos da Repostagem (destacou, confirmando, confirmado) por copy ou por avatar, nas Páginas dadas."""
+    out: Counter = Counter()
+    for m in _mp4s_repostagem().values():
+        if m.get("estado") in CAMPEAO_ROTULO and m.get("estado") != "cansado" and m.get(campo) and m.get("dest") in dests:
+            out[str(m[campo])] += 1
+    return out
+
+
+def ranking_copies(linhas: list[dict], cfg: dict, fracas: dict) -> list[dict]:
+    """Ranking das copies ("copy 25"), somando as Páginas: o mesmo cálculo do ranking dos avatares (bayes, outliers,
+    comentários), mais os vídeos bons, os campeões da Repostagem e se ela já não funcionou. Reposts ficam de fora."""
+    campeoes = campeoes_por("copy", {a["dest"] for a in linhas})
+    validas = [a for a in linhas if SO_COPIA_RE.match(a.get("formato") or "")]
+    out = []
+    for r in ranking(validas, "formato"):
+        info = cfg["criativos"].get(r["chave"]) or {}
+        status = ("campeã" if campeoes[r["chave"]] else "não funcionou" if r["chave"] in fracas
+                  else "em teste" if r["videos"] < CONSELHO_VIDEOS else "")
+        out.append({**r, "campeoes": campeoes[r["chave"]], "status": status,
+                    "nome": info.get("nome", ""), "gancho": info.get("gancho", ""), "papel": info.get("papel", "")})
+    return sorted(out, key=lambda r: (-r["campeoes"], -r["bons"], -r["score_bayes"]))
+
+
+def avatares_na_roleta(S: dict | None, idioma: str = "en") -> dict[str, dict]:
+    """Número do avatar -> se está ativo na Roleta e em que Página cai hoje e amanhã (1 avatar por Página)."""
+    if not S:
+        return {}
+    lang = "es" if idioma == "es" else "en"
+    hoje = datetime.now().date()
+    nomes = {rid: (p.get("nome") or rid).strip() for rid, p in (S.get("paginas") or {}).items()}
+    dia = {}
+    for n_dia, d in (("hoje", hoje), ("amanha", hoje + timedelta(days=1))):
+        try:
+            plano_d = roleta.plano(S, d.isoformat(), idioma=lang)
+        except Exception:
+            plano_d = {}
+        for rid, avs in plano_d.items():
+            for a in avs:
+                if a:
+                    dia.setdefault(a, {})[n_dia] = nomes.get(rid, rid)
+    out = {}
+    for avid, a in (S.get("avatares") or {}).items():
+        if roleta.idioma_de(a) != lang or not (n := roleta.numero_avatar(S, avid)):
+            continue
+        out[n] = {"ativo": a.get("ativo") is not False, "hoje": dia.get(avid, {}).get("hoje"),
+                  "amanha": dia.get(avid, {}).get("amanha")}
+    return out
 
 
 def _views_na_idade(p: dict, horas: float) -> float | None:
@@ -751,6 +932,7 @@ def subindo(posts: dict, cfg: dict, agora: int) -> list[dict]:
                             "plays_total": p.get("plays_total"), "replay_x": replay_x, "comments": comm_v,
                             "esperado": round(base), "vezes": vezes, "horas": int(horas), "por_idade": por_idade,
                             "avatar": p.get("avatar"), "formato": p.get("formato"), "criado": p["criado"],
+                            "capa": p.get("capa"), "repost": p.get("formato") in REPOSTS,
                             "criativo": _nome_formato(cfg, p.get("formato"))})
     return sorted(out, key=lambda x: (x["vezes"], x.get("comments") or 0), reverse=True)
 
@@ -1971,7 +2153,7 @@ def publico(idioma: str | None = None) -> dict:
             ({"num": n, **v} for n, v in cfg["tipos_avatar"].items() if not lang_f or mapa_av_id.get(str(n), "en") == lang_f),
             key=lambda a: int(a["num"]),
         )
-        return {"config": {"piso_views": cfg["piso_views"], "min_posts": cfg["min_posts"], "piso_cedo": cfg["piso_cedo"],
+        res = {"config": {"piso_views": cfg["piso_views"], "min_posts": cfg["min_posts"], "piso_cedo": cfg["piso_cedo"],
                            "resumo_hora": cfg["resumo_hora"], "tem_webhook": bool(cfg["webhook"]),
                            "relatorio_hora": cfg["relatorio_hora"], "tem_webhook_relatorio": bool(cfg["webhook_relatorio"]),
                            **{k: cfg[k] for k in ("fase2_views", "fase2_vezes", "fase2_videos", "fase3_views", "fase3_vezes", "fase3_videos",
@@ -2005,6 +2187,16 @@ def publico(idioma: str | None = None) -> dict:
                 "proxima": proxima_coleta(datetime.now(), cfg["horarios_coleta"]), "coletando": _coleta.locked(),
                 "erro": estado["erro"], "faltam": estado["faltam"], "videos": lidos,
                 "destaques": [a for a in linhas if a["faixa"] and a["recente"]], "contas": contas}
+    # 15/11/2026: fora do lock do radar, porque leem o repostagem.json (com o lock da Repostagem)
+    res["ranking_paginas"] = ranking_paginas(contas, agora)
+    res["copies_rank"] = ranking_copies(linhas, cfg, res["fracas"])
+    na_roleta = avatares_na_roleta(S_view, lang_f or "en")
+    camp_av = campeoes_por("avatar", {c["dest"] for c in contas})
+    for r in res["avatares"]:
+        r["roleta"] = na_roleta.get(str(r["chave"]))
+        r["campeoes"] = camp_av[str(r["chave"])]
+    res["avatares_ativos"] = sum(1 for v in na_roleta.values() if v["ativo"])
+    return res
 
 
 def _configurar(body: dict) -> str:
