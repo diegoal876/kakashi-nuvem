@@ -1158,7 +1158,7 @@ def _livre_no_dia(pid: str, dia: datetime, agora: float) -> int | None:
                 and any(d.partition(":")[2] == pid for d in i["destinos"])}
     for h, m in _horarios(pid):
         t = _horario(pid, dia, h, m)
-        if t > agora + 15 * 60 and t not in ocupados:
+        if t > agora + 15 * 60 and t not in ocupados and t <= _limite(dia):
             return t
     return None
 
@@ -1169,9 +1169,9 @@ def _dias(n=29) -> list[datetime]:
 
 
 def proximo_horario(pid: str) -> int | None:
-    """The Page's next posting time no other video of it holds yet (from 15 min from now, up to 29 days)."""
+    """The Page's next posting time no other video of it holds yet, on the posting day only (see _dias_postagem)."""
     agora = time.time()
-    return next((t for dia in _dias() if (t := _livre_no_dia(pid, dia, agora))), None)
+    return next((t for dia in _dias_postagem(agora) if (t := _livre_no_dia(pid, dia, agora))), None)
 
 
 def roleta_dados() -> dict | None:
@@ -1234,6 +1234,22 @@ def roleta_gravar(body: dict) -> dict:
 
 FIM_DO_DIA_H = 0  # Roleta day aligns with calendar day starting at 00:00
 INTERVALO_PAGINA_S = 3 * 3600  # between two posts of the same Page
+HORA_LIMITE_H = 10  # 16/11/2026: every automatic time of a day is at most 10:00 in the morning (the user's rule)
+
+
+def _limite(dia: datetime) -> float:
+    """The latest automatic posting time of a Roleta day: HORA_LIMITE_H that morning."""
+    return dia.replace(hour=HORA_LIMITE_H, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _dias_postagem(agora: float | None = None) -> list[datetime]:
+    """The one day new videos are placed on: today while there is still time before HORA_LIMITE_H, else tomorrow.
+    16/11/2026: a video never goes further than that. Before, a video whose avatar's Page was full went to the first
+    day ahead where the avatar had another Page (up to 29 days), took the copy number there and pushed that Page's own
+    video further still (23 videos spread from 17/11 to 02/12). A video that does not fit stays a draft without a Page."""
+    agora = agora or time.time()
+    hoje = datetime.fromtimestamp(agora).replace(hour=0, minute=0, second=0, microsecond=0)
+    return [hoje] if agora + 15 * 60 < _limite(hoje) else [hoje + timedelta(days=1)]
 
 
 def _janela(dia: datetime) -> tuple[float, float]:
@@ -1255,8 +1271,9 @@ def _da_pagina(pid: str, de: float, ate: float) -> list[dict]:
 
 def _vaga_no_dia(pid: str, dia: datetime, agora: float) -> int | None:
     """The Page's earliest time in that Roleta day at least INTERVALO_PAGINA_S away from its other posts: from its
-    first posting time (with broken minutes), or 15 min from now on the current day, until 6h the next morning."""
+    first posting time (with broken minutes), or 15 min from now on the current day, until HORA_LIMITE_H (10:00)."""
     de, ate = _janela(dia)
+    lim = min(ate, _limite(dia))
     h, m = _horarios(pid)[0]
     # on the current day: 15 min from now plus the Page's own broken minutes, so the Pages do not all start together
     quebra = _horario(pid, dia, 0) - dia.timestamp()
@@ -1268,7 +1285,7 @@ def _vaga_no_dia(pid: str, dia: datetime, agora: float) -> int | None:
         if d.partition(":")[2] == pid and r.get("estado") == "ok" and de - INTERVALO_PAGINA_S <= r.get("em", 0) < ate + INTERVALO_PAGINA_S
     ]
     for t in sorted({int(ini), *(int(o + INTERVALO_PAGINA_S) for o in perto)}):
-        if ini <= t <= ate and all(abs(t - o) >= INTERVALO_PAGINA_S for o in perto):
+        if ini <= t <= lim and all(abs(t - o) >= INTERVALO_PAGINA_S for o in perto):
             return t
     return None
 
@@ -1379,7 +1396,7 @@ def _vaga_roleta(nome: str, idioma: str | None = None) -> tuple[dict, int] | Non
         return None
     lang = _idioma(idioma) if idioma in ("en", "es") else _idioma_video(nome, S=S)
     casadas, agora = roleta.casar_paginas(S, contas().get("paginas", []), idioma=lang), time.time()
-    for dia in _dias():
+    for dia in _dias_postagem(agora):  # 16/11/2026: one day only; a video that does not fit stays a draft
         rid = roleta.avatar_para_pagina(S, dia.date().isoformat(), idioma=lang).get(n)
         pagina = _pagina(casadas.get(rid, ""))
         if not pagina:
@@ -2200,7 +2217,7 @@ def _horarios_na_pagina(pid: str, itens: list[dict]) -> None:
     `lock`."""
     agora = time.time()
     for i in itens:
-        i["quando"] = next((t for dia in _dias() if (t := _vaga_no_dia(pid, dia, agora))), None)
+        i["quando"] = next((t for dia in _dias_postagem(agora) if (t := _vaga_no_dia(pid, dia, agora))), None)
 
 
 def _tirar_da_meta(pid: str, vid: str) -> bool:
@@ -2533,6 +2550,39 @@ def destinos_lote(body: dict) -> str:
             (f" {pulados} ja postado(s) ou agendado(s) ficaram como estavam." if pulados else ""))
 
 
+def _dentro_da_regra(pid: str, t: int, ignorar: int | None = None) -> int | None:
+    """16/11/2026: the first time from t on that is INTERVALO_PAGINA_S away from every other video of the Page (posted,
+    scheduled or draft with a time) and not after HORA_LIMITE_H of its day; None when that day has no such time."""
+    dia = datetime.fromtimestamp(t).replace(hour=0, minute=0, second=0, microsecond=0)
+    de, ate = _janela(dia)
+    lim = min(ate, _limite(dia))
+    perto = [i["quando"] for i in _da_pagina(pid, de - INTERVALO_PAGINA_S, ate + INTERVALO_PAGINA_S)
+             if i["id"] != ignorar and i["status"] != "erro" and i.get("quando")] + [
+        r["em"] for i in fila["itens"] if i["id"] != ignorar for d, r in i.get("resultados", {}).items()
+        if d.partition(":")[2] == pid and r.get("estado") == "ok" and de - INTERVALO_PAGINA_S <= r.get("em", 0) < ate + INTERVALO_PAGINA_S]
+    for c in sorted({int(t), *(int(o + INTERVALO_PAGINA_S) for o in perto if o + INTERVALO_PAGINA_S > t)}):
+        if c <= lim and all(abs(c - o) >= INTERVALO_PAGINA_S for o in perto):
+            return c
+    return None
+
+
+def _espalhado(pid: str, t: int, ignorar: int | None = None) -> int | None:
+    """16/11/2026: the first time from t on that follows the Page's rule (_dentro_da_regra) and is ENVIO_INTERVALO_S
+    away from every other scheduled video of any Page. The worker sends one video every ENVIO_INTERVALO_S (~24 an hour,
+    the guard against Meta blocking the app); "Agendar todos" at 00h50 put ~50 videos between 01h05 and 01h29, and
+    they went out up to 1h30 late. None when the day has no such time until HORA_LIMITE_H."""
+    for _ in range(500):
+        t2 = _dentro_da_regra(pid, int(t), ignorar) if pid else int(t)
+        if not t2:
+            return None
+        perto = [i["quando"] for i in fila["itens"] if i["id"] != ignorar and i["status"] == "agendado"
+                 and i.get("quando") and abs(i["quando"] - t2) < ENVIO_INTERVALO_S]
+        if not perto:
+            return t2
+        t = max(perto) + ENVIO_INTERVALO_S
+    return None
+
+
 def lote(body: dict) -> str:
     """Schedule drafts from inicio, each Page's videos spaced by intervalo_h (the Pages a few minutes apart, so they
     do not all post at once): the ones in "ids" (ticked on the page), else every draft (only the ones going to
@@ -2550,7 +2600,7 @@ def lote(body: dict) -> str:
         raise Recusa("Escolha um horario no futuro para o primeiro.")
     if passo < 15 * 60:
         raise Recusa("Deixe pelo menos 15 minutos entre um video e outro.")
-    feitos, pulados, vez = [], 0, {}
+    feitos, pulados, vez, fora_regra = [], 0, {}, 0
     with lock:
         for item in sorted((i for i in fila["itens"] if i["status"] == "rascunho" and da_pagina(i)), key=lambda i: i["id"]):
             pg = item["destinos"][0].partition(":")[2] if item["destinos"] else ""
@@ -2565,6 +2615,14 @@ def lote(body: dict) -> str:
             if not item["destinos"] or quando > time.time() + MAX_FUTURO_S:
                 pulados += 1
                 continue
+            # 16/11/2026: 3h de todo vídeo da Página (inclusive os já postados) e nunca depois das 10h; antes o lote só
+            # espaçava os vídeos dele e pôs 01h19 a 1h de um vídeo das 00h22
+            ajustado = _espalhado(pg, int(quando), ignorar=item["id"])
+            dia_aj = datetime.fromtimestamp(ajustado).replace(hour=0, minute=0, second=0, microsecond=0) if ajustado else None
+            if not ajustado or (pg and len([x for x in _no_dia(pg, dia_aj) if x["id"] != item["id"]]) >= VAGAS_REPOSTAGEM):
+                fora_regra += 1  # sem horário até as 10h, ou a Página já tem os 3 vídeos do dia
+                continue
+            quando = ajustado
             item["quando"] = int(quando)
             try:
                 _agendar(item)
@@ -2575,12 +2633,14 @@ def lote(body: dict) -> str:
         _salvar()
     threading.Thread(target=_sincronizar_nuvem, kwargs={"forcar": True}, daemon=True).start()
     wake.set()
+    regra = (f" {fora_regra} ficaram em rascunho: a Pagina ja tem 3 videos no dia ou nao tem horario com 3h dos "
+             f"outros videos ate as {HORA_LIMITE_H}h." if fora_regra else "")
     if not feitos:
-        raise Recusa("Nenhum video agendado: escolha a Pagina deles primeiro.")
+        raise Recusa("Nenhum video agendado: escolha a Pagina deles primeiro." + regra)
     feitos.sort()
-    return (f"{len(feitos)} video(s) agendado(s), um a cada {passo / 3600:g} h em cada Pagina, de "
+    return (f"{len(feitos)} video(s) agendado(s), com {passo / 3600:g} h ou mais entre os videos de cada Pagina, de "
             f"{_quando_txt(feitos[0])} a {_quando_txt(feitos[-1])}." +
-            (f" {pulados} ficaram de fora (sem Pagina ou alem de 29 dias)." if pulados else "") + _ritmo_txt())
+            (f" {pulados} ficaram de fora (sem Pagina ou alem de 29 dias)." if pulados else "") + regra + _ritmo_txt())
 
 
 def _ler_horarios(texto: str) -> list[str]:
@@ -2639,7 +2699,7 @@ def agendar_sugeridos(body: dict) -> str:
     time of its Page. Takes the ticked ones ("ids"), else every draft (of "pagina" when given)."""
     _sem_bloqueio()
     ids, pid, agora = body.get("ids"), str(body.get("pagina") or ""), time.time()
-    feitos, sem_pagina = [], 0
+    feitos, sem_pagina, repost_vencido, sem_vaga = [], 0, 0, 0
     with lock:
         for item in sorted((i for i in fila["itens"] if i["status"] == "rascunho"), key=lambda i: i["id"]):
             if ids is not None and item["id"] not in ids or ids is None and pid and \
@@ -2649,28 +2709,47 @@ def agendar_sugeridos(body: dict) -> str:
                 sem_pagina += 1
                 continue
             if not item["quando"] or item["quando"] < agora + 60:
+                if item.get("repost_de"):
+                    repost_vencido += 1  # a repost belongs to its day's plan: one whose day went by is not moved
+                    continue
                 lugar = item.get("auto") and _lugar_auto(item["nome"])
                 if lugar:
                     item["destinos"], item["quando"] = _destinos_drive(lugar[0]), lugar[1]
                 else:
-                    item["quando"] = proximo_horario(item["destinos"][0].partition(":")[2])
+                    item["quando"] = _vaga_dentro_das_regras(item["destinos"][0].partition(":")[2], agora)
             try:
                 if not item["quando"]:
                     raise Recusa("sem horario livre")
+                # 16/11/2026: no ritmo de envio do painel (ENVIO_INTERVALO_S) e na regra da Página (3h, até as 10h)
+                espalhado = _espalhado(item["destinos"][0].partition(":")[2], item["quando"], ignorar=item["id"])
+                if not espalhado:
+                    raise Recusa("sem horario livre")
+                item["quando"] = espalhado
                 _agendar(item)
             except Recusa:
-                sem_pagina += 1
+                sem_vaga += 1
                 continue
             feitos.append(item["quando"])
         _salvar()
     threading.Thread(target=_sincronizar_nuvem, kwargs={"forcar": True}, daemon=True).start()
     wake.set()
+    fora = (f" {sem_pagina} sem Pagina ficaram de fora." if sem_pagina else "") + \
+           (f" {repost_vencido} repost(s) de um dia que ja passou ficaram em rascunho." if repost_vencido else "") + \
+           (f" {sem_vaga} sem vaga dentro das regras ficaram em rascunho." if sem_vaga else "")
     if not feitos:
-        raise Recusa("Nenhum video agendado: escolha a Pagina deles primeiro.")
+        raise Recusa("Nenhum video agendado." + fora)
     feitos.sort()
-    return (f"{len(feitos)} video(s) agendado(s) nos horarios de cada Pagina, de {_quando_txt(feitos[0])} "
-            f"a {_quando_txt(feitos[-1])}." + (f" {sem_pagina} ficaram de fora (sem Pagina)." if sem_pagina else "") +
-            _ritmo_txt())
+    return (f"{len(feitos)} video(s) agendado(s) nos horarios sugeridos, de {_quando_txt(feitos[0])} "
+            f"a {_quando_txt(feitos[-1])}." + fora + _ritmo_txt())
+
+
+def _vaga_dentro_das_regras(pid: str, agora: float) -> int | None:
+    """For a draft whose suggested time is gone and that the panel did not place itself: the posting day, if the Page
+    has fewer than 3 videos there, at a time 3h away from its other posts and up to 10:00 (never a later day)."""
+    for dia in _dias_postagem(agora):
+        if len(_no_dia(pid, dia)) < VAGAS_REPOSTAGEM and (t := _vaga_no_dia(pid, dia, agora)):
+            return t
+    return None
 
 
 def cancelar(body: dict) -> str:

@@ -2320,7 +2320,6 @@ def publico(idioma: str | None = None) -> dict:
                     else {str(n): int(f.stat().st_mtime) for n, f in (_fotos() if _fotos else []) if f.is_file()}
                 ),
                 "avatares_trocados": cfg.get("avatares_trocados", {}),
-                "escala_cruzada": escala_cruzada(linhas, contas, cfg, idioma=lang_f),
                 "rclone_client": _status_rclone(),
                 "ganchos": ranking(linhas, "gancho"), "papeis": ranking(linhas, "papel"), "idades": ranking(linhas, "idade"),
                 "cabelos": ranking(linhas, "cabelo"), "sinergias": ranking(linhas, "sinergia"),
@@ -2334,6 +2333,9 @@ def publico(idioma: str | None = None) -> dict:
                 "erro": estado["erro"], "faltam": estado["faltam"], "videos": lidos,
                 "destaques": [a for a in linhas if a["faixa"] and a["recente"]], "contas": contas}
     # 15/11/2026: fora do lock do radar, porque leem o repostagem.json (com o lock da Repostagem)
+    # 16/11/2026: a escala cruzada pega a trava da fila da Postagem; dentro da trava do radar ela travava o painel com a
+    # distribuição dos vídeos (que segura a trava da fila e lê o radar)
+    res["escala_cruzada"] = escala_cruzada(linhas, contas, cfg, idioma=lang_f)
     res["ranking_paginas"] = ranking_paginas(contas, agora)
     res["copies_rank"] = ranking_copies(linhas, cfg, res["fracas"])
     res["copies_sugeridas"] = copies_sugeridas(lang_f, {r["chave"]: r for r in res["copies_rank"]})
@@ -2659,7 +2661,7 @@ def escala_cruzada(linhas: list[dict], contas: list[dict], cfg: dict, idioma: st
     medianas = {c["dest"]: (c.get("mediana") or 0) for c in contas if c.get("pronta")}
     # Track which (dest, avatar, formato) or (dest, formato) already ran or are queued
     ja_rodou: set[tuple[str, str, str]] = set()
-    for p in estado["posts"].values():
+    for p in list(estado["posts"].values()):  # fora da trava do radar desde 16/11/2026
         if p.get("dest") and p.get("avatar") and p.get("formato"):
             ja_rodou.add((p["dest"], str(p["avatar"]), str(p["formato"])))
     with postagem.lock:
