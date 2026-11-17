@@ -803,6 +803,110 @@ def conselhos(linhas: list[dict]) -> list[dict]:
     return sorted(out, key=lambda c: c["pagina"].lower())
 
 
+# ─── Ranking das contas (16/11/2026) ─────────────────────
+# Pedido do usuário: qual Página é melhor, comparando as Páginas entre si. O × não serve para isso (mede cada vídeo
+# contra a própria Página), então cada critério vira o percentil da Página entre as Páginas prontas do mesmo idioma
+# (0 a 100) e a nota é a média ponderada. Como é 1 avatar por Página na Roleta nova, a "dependência" é medida nas copies.
+CONTA_JANELA = MAX_POSTS     # vídeos inéditos mais novos com 24h+: os mesmos da mediana
+CONTA_TEND_NOVOS = 7         # tendência: mediana destes mais novos...
+CONTA_TEND_ANTES = 30        # ...contra a dos anteriores até este ponto...
+CONTA_TEND_MIN = 5           # ...com pelo menos este tanto de vídeos antes
+CONTA_COPY_X = 2             # uma copy "funciona" na Página com um vídeo de 2× o normal ou mais
+CONTA_K = 4                  # amostra pequena: a nota é puxada para 50 com este peso (como o bayesiano dos avatares)
+CONTA_QUEDA = 0.3            # tendência abaixo disto (caiu 70% ou mais) vira alerta
+CONTA_PARADA_DIAS = 4        # sem post nenhum (nem repost) há este tanto: parada, fora da posição e da comparação
+PESOS_CONTA = {"entrega": 25, "tendencia": 15, "bons": 15, "consistencia": 10, "engajamento": 10,
+               "retem6": 10, "fim": 5, "copies": 10}
+NOME_CRITERIO = {"entrega": "entrega", "tendencia": "tendência", "bons": "vídeos bons", "consistencia": "consistência",
+                 "engajamento": "engajamento", "retem6": "gancho (6s)", "fim": "retenção até o fim", "copies": "copies que funcionam"}
+
+
+def _percentil(valor: float, ref: list[float]) -> float:
+    """Posição de valor entre as Páginas de referência, de 0 a 100 (empate conta meio)."""
+    if not ref:
+        return 50.0
+    menores = sum(1 for r in ref if r < valor)
+    iguais = sum(1 for r in ref if r == valor)
+    return 100 * (menores + iguais / 2) / len(ref)
+
+
+def _criterios_conta(lista: list[dict], mediana: float | None, bom) -> dict:
+    """Valores brutos de uma Página, só com os vídeos inéditos (repost rende menos por natureza)."""
+    ineditos = sorted((a for a in lista if not a.get("repost")), key=lambda a: -a["criado"])
+    jan = ineditos[:CONTA_JANELA]
+    if not jan:
+        return {}
+    views = [a["views"] or 0 for a in jan]
+    novos = [a["views"] or 0 for a in ineditos[:CONTA_TEND_NOVOS]]
+    antes = [a["views"] or 0 for a in ineditos[CONTA_TEND_NOVOS:CONTA_TEND_ANTES]]
+    med_antes = median(antes) if len(antes) >= CONTA_TEND_MIN else None
+    eng = [1000 * (3 * (a.get("shares") or 0) + (a.get("comments") or 0)) / a["views"]
+           for a in jan if (a["views"] or 0) >= MEDIANA_MIN and (a.get("shares") is not None or a.get("comments") is not None)]
+    copies = {a["formato"] for a in jan if SO_COPIA_RE.match(a.get("formato") or "") and a["score"] >= CONTA_COPY_X}
+    return {"entrega": mediana or 0,
+            "tendencia": round(median(novos) / max(med_antes, MEDIANA_MIN), 2) if med_antes is not None and novos else None,
+            "bons": round(100 * sum(1 for a in jan if bom(a)) / len(jan), 1),
+            "consistencia": round(100 * sum(1 for v in views if v >= MEDIANA_MIN) / len(jan)),
+            "engajamento": round(median(eng), 1) if eng else None,
+            # retenção de vídeo sem entrega é ruído (0 views dava 100% ou 0%)
+            "retem6": _mediana(a.get("retem6") for a in jan if (a["views"] or 0) >= MEDIANA_MIN),
+            "fim": _mediana(a.get("fim") for a in jan if (a["views"] or 0) >= MEDIANA_MIN),
+            "copies": len(copies), "_videos": len(jan), "_med_antes": med_antes,
+            "_comentarios": sum(a.get("comments") or 0 for a in jan), "_melhor": max(views)}
+
+
+def ranking_contas(linhas: list[dict], contas: list[dict], cfg: dict, posts: dict, agora: int,
+                   suspeitas: list[dict] | None = None) -> list[dict]:
+    """Uma linha por Página com a nota (0 a 100), a posição no idioma, os critérios e os alertas. Só as Páginas prontas
+    e ativas têm posição e servem de comparação; as com poucos dados (em avaliação) e as paradas ganham a nota
+    comparada a elas, sem posição."""
+    bom = _bom(cfg)
+    por_dest: dict[str, list] = {}
+    for a in linhas:
+        por_dest.setdefault(a["dest"], []).append(a)
+    ultimo: dict[str, int] = {}
+    for p in posts.values():
+        if p.get("dest") and p.get("criado"):
+            ultimo[p["dest"]] = max(ultimo.get(p["dest"], 0), p["criado"])
+    restritas = {s["dest"]: s for s in suspeitas or []}
+    out = []
+    for c in contas:
+        crit = _criterios_conta(por_dest.get(c["dest"], []), c.get("mediana"), bom)
+        if crit:
+            dias = (agora - ultimo.get(c["dest"], agora)) / 86400
+            out.append({**c, "crit": crit, "parada": dias >= CONTA_PARADA_DIAS, "dias_sem_post": int(dias)})
+    for idioma in {r["idioma"] for r in out}:
+        grupo = [r for r in out if r["idioma"] == idioma]
+        for r in grupo:
+            r["ranqueada"] = r["pronta"] and not r["parada"]
+        ref = {k: [r["crit"][k] for r in grupo if r["ranqueada"] and r["crit"].get(k) is not None] for k in PESOS_CONTA}
+        for r in grupo:
+            pcts = {k: round(_percentil(r["crit"][k], ref[k])) for k in PESOS_CONTA if r["crit"].get(k) is not None}
+            peso = sum(PESOS_CONTA[k] for k in pcts)
+            bruta = sum(PESOS_CONTA[k] * p for k, p in pcts.items()) / peso if peso else 50
+            n = r["crit"]["_videos"]
+            r["nota"] = round((n * bruta + CONTA_K * 50) / (n + CONTA_K))
+            r["pcts"] = pcts
+            ordem = sorted(pcts, key=lambda k: pcts[k])
+            r["forte"] = NOME_CRITERIO[ordem[-1]] if ordem and pcts[ordem[-1]] >= 70 else None
+            r["fraco"] = NOME_CRITERIO[ordem[0]] if ordem and pcts[ordem[0]] <= 30 else None
+            alertas = []
+            if r["parada"]:
+                alertas.append(f"parada: nenhum post há {r['dias_sem_post']} dias")
+            if r["pronta"] and (r.get("mediana") or 0) < MEDIANA_MIN:  # o selo sem_entrega deixa de fora a mediana 0
+                alertas.append("quase sem entrega (mediana abaixo de 100 views)")
+            t, antes = r["crit"].get("tendencia"), r["crit"].get("_med_antes")
+            if t is not None and t < CONTA_QUEDA and antes and antes >= MEDIANA_MIN and not r["parada"]:
+                alertas.append(f"views caíram {round(100 * (1 - t))}% nos últimos {CONTA_TEND_NOVOS} vídeos")
+            if r["dest"] in restritas:
+                alertas.append(f"parece restrita: últimos vídeos {restritas[r['dest']]['queda']}% abaixo do normal na mesma idade")
+            r["alertas"] = alertas
+        prontas = sorted((r for r in grupo if r["ranqueada"]), key=lambda r: (-r["nota"], -(r.get("mediana") or 0)))
+        for i, r in enumerate(prontas, 1):
+            r["posicao"] = i
+    return sorted(out, key=lambda r: (not r["ranqueada"], r["parada"], r["idioma"], r.get("posicao") or 0, -r["nota"]))
+
+
 # ─── Aba Virais na Repostagem (15/11/2026) ───────────────
 # Campeão e outlier vêm da Repostagem (repostagem.json), que é quem decide os reposts: assim a aba aponta os mesmos
 # vídeos que vão para as vagas. O radar só soma as views e a capa de cada um.
@@ -2331,7 +2435,8 @@ def publico(idioma: str | None = None) -> dict:
                 "ultima_coleta": estado["ultima_coleta"], "ultima_tentativa": estado["ultima_tentativa"],
                 "proxima": proxima_coleta(datetime.now(), cfg["horarios_coleta"]), "coletando": _coleta.locked(),
                 "erro": estado["erro"], "faltam": estado["faltam"], "videos": lidos,
-                "destaques": [a for a in linhas if a["faixa"] and a["recente"]], "contas": contas}
+                "destaques": [a for a in linhas if a["faixa"] and a["recente"]], "contas": contas,
+                "contas_rank": ranking_contas(linhas, contas, cfg, posts_src, agora, restricoes_suspeitas(posts_src, agora))}
     # 15/11/2026: fora do lock do radar, porque leem o repostagem.json (com o lock da Repostagem)
     # 16/11/2026: a escala cruzada pega a trava da fila da Postagem; dentro da trava do radar ela travava o painel com a
     # distribuição dos vídeos (que segura a trava da fila e lê o radar)
