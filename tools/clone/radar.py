@@ -45,8 +45,10 @@ from math import ceil
 from pathlib import Path
 from statistics import median
 
+import idiomas
 import postagem
 import roleta
+from idiomas import IDIOMAS
 from postagem import GraphError, Recusa, graph
 
 RADAR_FILE = postagem.DIR / "radar.json"
@@ -1026,7 +1028,7 @@ _cache_placar: dict = {}
 
 def placar_copies(idioma: str | None = None) -> dict[str, dict]:
     """copy -> a linha dela no ranking das copies (campeões, bons, bayes, status), de um idioma. Cache de 2 min."""
-    lang = idioma if idioma in ("en", "es") else None
+    lang = idioma if idioma in IDIOMAS else None
     chave = (lang, int(time.time()) // 120)
     if chave in _cache_placar:
         return _cache_placar[chave]
@@ -1079,7 +1081,7 @@ def avatares_na_roleta(S: dict | None, idioma: str = "en") -> dict[str, dict]:
     """Número do avatar -> se está ativo na Roleta e em que Página cai hoje e amanhã (1 avatar por Página)."""
     if not S:
         return {}
-    lang = "es" if idioma == "es" else "en"
+    lang = idiomas.norm(idioma)
     hoje = datetime.now().date()
     nomes = {rid: (p.get("nome") or rid).strip() for rid, p in (S.get("paginas") or {}).items()}
     dia = {}
@@ -1248,7 +1250,7 @@ def _fracos_na_roda(fracos: dict, S: dict | None, idioma: str = "en") -> dict[st
     """The weak avatars still rotating on the Roleta and not kept by the user, with their Roleta id."""
     if not S:
         return {}
-    lang = "es" if str(idioma or "").lower() == "es" else "en"
+    lang = idiomas.norm(idioma)
     por_numero = {roleta.numero_avatar(S, a): a for a, obj in S.get("avatares", {}).items() if roleta.idioma_de(obj) == lang}
     oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if roleta.fase_efetiva(p) == 3}
     return {n: {**f, "avid": por_numero[n]} for n, f in fracos.items()
@@ -1432,7 +1434,7 @@ def sugestoes(linhas: list[dict], cfg: dict, S: dict | None, conectadas: list[di
     antigo = lambda a: agora - a["criado"] >= FASE3_ESPERA_H * 3600
     globais_por_lang = {
         lang: criativos_globais([a for a in linhas if a.get("idioma", "en") == lang], cfg)
-        for lang in ("en", "es")
+        for lang in IDIOMAS
     }
     por_fb = {fb: pg for pg, fb in roleta.casar_paginas(S, conectadas).items()}
     oficiais = {p.get("avatarOficial") for p in S.get("paginas", {}).values() if roleta.fase_efetiva(p) == 3}
@@ -1699,7 +1701,7 @@ def _video_local(key: str, copia: str | None = None) -> str | None:
         pastas = [postagem.VIDEOS]
         drive_p = Path(postagem.fila.get("config", {}).get("pasta_drive") or r"G:\Meu Drive\Non Shop\001\Postagens")
         if drive_p.is_dir():
-            pastas.extend([drive_p / "_Rodízio", drive_p / "_Rodízio ES", drive_p, drive_p.parent / "_kakashi_nuvem" / "videos"])
+            pastas.extend([*(drive_p / r for r in idiomas.RODIZIO.values()), drive_p, drive_p.parent / "_kakashi_nuvem" / "videos"])
         for pasta in pastas:
             if not pasta.is_dir():
                 continue
@@ -1960,7 +1962,7 @@ def mensagem(a: dict, agora: int) -> str:
     h = (agora - a["criado"]) // 3600
     dados = [f"Postado há {h}h" if h < 72 else f"Postado há {h // 24} dias"]
     dados = _rotulos(a) + dados
-    tag_es = "🇪🇸 " if a.get("idioma") == "es" else ""
+    tag_es = f"{idiomas.BANDEIRA[a['idioma']]} " if a.get("idioma") in IDIOMAS and a.get("idioma") != "en" else ""
     rep = _repost(a)
     return "\n".join([
         f"{ICONE[a['faixa']]} {tag_es}**{rep[0]}{NOME_FAIXA[a['faixa']]} em {a['pagina']}**",
@@ -1989,7 +1991,7 @@ def _repost(a: dict) -> list[str]:
 def mensagem_cedo(s: dict) -> str:
     base = f"{_num(s['esperado'])} esperadas para {s['horas']}h no ar" if s["por_idade"] else f"{_num(s['esperado'])} de mediana"
     titulo = "🚀 **JÁ VIRALIZANDO" if s["vezes"] >= dict(FAIXAS)["super"] else "⚡ **PODE VIRALIZAR"
-    tag_es = "🇪🇸 " if s.get("idioma") == "es" else ""
+    tag_es = f"{idiomas.BANDEIRA[s['idioma']]} " if s.get("idioma") in IDIOMAS and s.get("idioma") != "en" else ""
     rep = _repost(s)
     if rep[0]:
         titulo = titulo.replace("**", "**" + rep[0], 1)
@@ -2369,7 +2371,7 @@ def _sugestoes_agora(agora: int) -> list[dict]:
 
 def publico(idioma: str | None = None) -> dict:
     agora = int(time.time())
-    lang_f = idioma if idioma in ("en", "es") else None
+    lang_f = idioma if idioma in IDIOMAS else None
     idiomas_d = _idiomas_dest()
     mapa_av_id = postagem._mapa_idiomas_avatares()
     with lock:
@@ -2417,10 +2419,10 @@ def publico(idioma: str | None = None) -> dict:
                 "avatares_fracos": _fracos_na_roda(avatares_fracos(linhas, cfg), S_view, idioma=(lang_f or "en")),
                 "controle": comparar_controle(linhas, S_view, conectadas_view, agora),
                 "paginas": conselhos(linhas), "copies": copies,
-                "fotos": list(postagem._mapa_fotos_avatares(lang_f).keys()) if lang_f == "es" else [n for n, _ in (_fotos() if _fotos else [])],
+                "fotos": list(postagem._mapa_fotos_avatares(lang_f).keys()) if lang_f not in (None, "en") else [n for n, _ in (_fotos() if _fotos else [])],
                 "fotos_v": (
-                    {str(n): int(f.stat().st_mtime) for n, f in postagem._mapa_fotos_avatares("es").items() if f.is_file()}
-                    if lang_f == "es"
+                    {str(n): int(f.stat().st_mtime) for n, f in postagem._mapa_fotos_avatares(lang_f).items() if f.is_file()}
+                    if lang_f not in (None, "en")
                     else {str(n): int(f.stat().st_mtime) for n, f in (_fotos() if _fotos else []) if f.is_file()}
                 ),
                 "avatares_trocados": cfg.get("avatares_trocados", {}),
@@ -2692,9 +2694,9 @@ def _avatar_fraco(body: dict) -> str:
 def registrar_troca_avatar(num: int, idade: str | None = None, cabelo: str | None = None, idioma: str = "en") -> None:
     """When an avatar's face is replaced while keeping its number: videos posted before now stop counting against the
     new face, its age/hair traits are updated (or cleared), and its slot stays active."""
-    lang = "es" if str(idioma or "").lower() == "es" else "en"
+    lang = idiomas.norm(idioma)
     n = str(num)
-    chave_av = f"es:{n}" if lang == "es" else n
+    chave_av = f"{idiomas.CHAVE_RADAR[lang]}{n}"
     agora = int(time.time())
     with lock:
         estado["config"].setdefault("avatares_trocados", {})[chave_av] = agora
@@ -2717,7 +2719,7 @@ def registrar_troca_avatar(num: int, idade: str | None = None, cabelo: str | Non
             if roleta.idioma_de(a_obj) == lang and roleta.numero_avatar(S, avid) == n and a_obj.get("ativo") is False:
                 postagem.roleta_gravar({"op": "update", "caminho": f"avatares/{avid}", "dados": {"ativo": True}})
                 break
-    tag = " (ES)" if lang == "es" else ""
+    tag = f" ({idiomas.SIGLA[lang]})" if lang != "en" else ""
     postagem._log(f"Avatar {n}{tag}: rosto trocado mantendo o numero #{n} (placar anterior zerado no radar)")
 
 
@@ -2785,7 +2787,7 @@ def escala_cruzada(linhas: list[dict], contas: list[dict], cfg: dict, idioma: st
         if p_rol.get("pausada") or p_rol.get("fase") == 3 or roleta.repostagem(p_rol):
             continue
         lang_c = postagem._idioma(c.get("idioma"))
-        if idioma in ("en", "es") and lang_c != idioma:
+        if idioma in IDIOMAS and lang_c != idioma:
             continue
         pags_ativas.append({"dest": dest, "nome": c["nome"], "idioma": lang_c, "fase": p_rol.get("fase") or 1,
                             "formatoFixo": p_rol.get("formatoFixo") or "", "mediana": medianas.get(dest, 0)})
@@ -2932,7 +2934,7 @@ def get(h, path: str) -> None:
         from urllib.parse import parse_qs, urlparse
         q = parse_qs(urlparse(h.path).query)
         lang = (q.get("idioma") or [""])[0].strip().lower()
-        return h.send_json(publico(lang if lang in ("en", "es") else None))
+        return h.send_json(publico(lang if lang in IDIOMAS else None))
     if path == "/api/radar/relatorio.pdf":
         try:
             pdf = relatorio_pdf()
@@ -2948,8 +2950,8 @@ def get(h, path: str) -> None:
         q = parse_qs(urlparse(h.path).query)
         lang_q = (q.get("idioma") or ["en"])[0].strip().lower()
         num_s = path[len("/radar-foto/"):]
-        if lang_q == "es":
-            fotos_es = {str(n): f for n, f in postagem._mapa_fotos_avatares("es").items()}
+        if lang_q in IDIOMAS and lang_q != "en":
+            fotos_es = {str(n): f for n, f in postagem._mapa_fotos_avatares(lang_q).items()}
             return h.send_file(fotos_es.get(num_s), "image/jpeg")
         fotos = {str(n): f for n, f in (_fotos() if _fotos else [])}
         return h.send_file(fotos.get(num_s), "image/jpeg")
@@ -3165,7 +3167,7 @@ def _priorizar() -> None:
         return (3, 0) if m is None else (4, -m)
 
     nova = {}
-    for lang_p in ("en", "es"):
+    for lang_p in IDIOMAS:
         ordem_l = sorted((p for p in roleta.paginas(S, lang_p) if p.get("fase") != 3 and not p.get("pausada")), key=chave)
         for n_ord, p_item in enumerate(ordem_l, 1):
             nova[p_item["id"]] = n_ord

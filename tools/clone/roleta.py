@@ -1,12 +1,15 @@
 """The "Roleta de Páginas" rule, ported from its artifact (gerarPlano) so the panel knows which Page each avatar
-posts on each day. Supports independent language pools ("en" and "es") so English and Spanish operations never mix."""
+posts on each day. Supports independent language pools ("en", "es", "de") so the operations never mix."""
 import re
 from datetime import date
 from difflib import SequenceMatcher
 
+import idiomas
+from idiomas import IDIOMAS
+
 
 def idioma_de(o: dict | None) -> str:
-    return "es" if str((o or {}).get("idioma") or "").strip().lower() == "es" else "en"
+    return idiomas.norm((o or {}).get("idioma"))
 
 
 def _ordem(o: dict):
@@ -17,14 +20,14 @@ def _ordem(o: dict):
 
 def paginas(S: dict, idioma: str | None = None) -> list[dict]:
     itens = ({**p, "id": k} for k, p in S.get("paginas", {}).items())
-    if idioma in ("en", "es"):
+    if idioma in IDIOMAS:
         itens = (p for p in itens if idioma_de(p) == idioma)
     return sorted(itens, key=_ordem)
 
 
 def avatares(S: dict, idioma: str | None = None) -> list[dict]:
     itens = ({**a, "id": k} for k, a in S.get("avatares", {}).items())
-    if idioma in ("en", "es"):
+    if idioma in IDIOMAS:
         itens = (a for a in itens if idioma_de(a) == idioma)
     return sorted(itens, key=_ordem)
 
@@ -116,10 +119,10 @@ def _plano_idioma(S: dict, data: str, lang: str) -> dict[str, list]:
 
 
 def plano(S: dict, data: str, idioma: str | None = None) -> dict[str, list]:
-    """Roleta page id -> its avatar ids on that day (YYYY-MM-DD), isolated per language pool ('en' vs 'es')."""
-    if idioma in ("en", "es"):
+    """Roleta page id -> its avatar ids on that day (YYYY-MM-DD), isolated per language pool ('en', 'es', 'de')."""
+    if idioma in IDIOMAS:
         return _plano_idioma(S, data, idioma)
-    return {**_plano_idioma(S, data, "en"), **_plano_idioma(S, data, "es")}
+    return {k: v for lang in IDIOMAS for k, v in _plano_idioma(S, data, lang).items()}
 
 
 def numero_avatar(S: dict, avid: str) -> str | None:
@@ -129,7 +132,7 @@ def numero_avatar(S: dict, avid: str) -> str | None:
 
 
 def avatar_para_pagina(S: dict, data: str, idioma: str | None = None) -> dict[str, str]:
-    """Avatar number -> roleta page id on that day (optionally filtered to 'en' or 'es')."""
+    """Avatar number -> roleta page id on that day (optionally filtered to one language)."""
     out = {}
     for pid, avs in plano(S, data, idioma=idioma).items():
         for a in avs:
@@ -164,8 +167,8 @@ def _casar_grupo(pags_roleta: list[dict], conectadas: list[dict]) -> dict[str, s
 
 
 def casar_paginas(S: dict, conectadas: list[dict], idioma: str | None = None) -> dict[str, str]:
-    """Roleta page id -> connected Facebook Page id, matched strictly within the same language ('en' vs 'es')."""
-    langs = (idioma,) if idioma in ("en", "es") else ("en", "es")
+    """Roleta page id -> connected Facebook Page id, matched strictly within the same language."""
+    langs = (idioma,) if idioma in IDIOMAS else IDIOMAS
     out = {}
     for lang in langs:
         pags_r = paginas(S, lang)
